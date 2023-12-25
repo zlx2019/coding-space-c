@@ -22,7 +22,6 @@
 int main() {
     FILE* file;
     int ch;
-
     // 1. 创建/打开文件
     file = fopen("temp.txt","w+");
     if(file == NULL){
