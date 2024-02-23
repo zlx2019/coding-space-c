@@ -2207,9 +2207,1077 @@ counter: 9
 
 未决和阻塞标志可以用相同的数据类型sigset_t来存储，sigset_t称为信号集，这个类型可以表示每个信号的“有效”或“无效”状态，在阻塞信号集中“有效”和“无效”的含义是该信号是否被阻塞，而在未决信号集中“有效”和“无效”的含义是该信号是否处于未决状态。下一节将详细介绍信号集的各种操作。阻塞信号集也叫做当前进程的信号屏蔽字（Signal Mask），这里的“屏蔽”应该理解为阻塞而不是忽略。 
 
+### 5.捕捉信号
+
+如果信号的处理动作是用户自定义函数，在信号递达时就调用这个函数，这称为捕捉信号。由于信号处理函数的代码是在用户空间的，处理过程比较复杂，举例如下：
+
+1. 用户程序为`SIGQUIT`信号注册自定义处理函数`sighanler`；
+2. 当前正在执行`main`函数，这时发生中断或异常切换到内核态。
+3. 在中断处理完毕后要返回用户态的`main`函数之前检查到有信号`IGQUIT`递达。
+4. 内核决定返回用户态后不是恢复`main`函数的上下文继续执行，而是执行`sighandler`函数，`sighandler`和`main`函数使用不同的堆栈空间，它们之间不存在调用和被调用的关系，是两个独立的控制流程。
+5. `sighandler`函数返回后自动执行特殊的系统调用sigreturn再次进入内核态。
+6. 如果没有新的信号要递达，这次再返回用户态就是恢复`main`函数的上下文继续执行了。
+
+注意，当某个信号的处理函数被调用执行时，内核会自动将该信号加入进程的**信号屏蔽字**，当处理函数执行完后再恢复原来的信号屏蔽字，这样就能保证了在处理一个信号时，相同的信号再次产生，那么它会被阻塞到当前信号处理完毕结束为止。如果希望除了当前信号被自动屏蔽外，还希望屏蔽一些其他信号，则可以使用`sa_mask`字段来完成。
+
+#### 5.1 sigaction
+
+下面我们来介绍一个结构体: `sigaction`，该结构体就是信号的自定义描述，结构如下:
+
+```c
+#include <signal.h>
+
+struct sigaction{
+  void (*sa_hanlder) (int);
+  sigset_t sa_mask;
+  
+  int sa_flags;
+  void (*sa_sigaction) (int, siginfo_t *, void *);
+}
+```
+
+`sa_handler`: 自定义处理函数的函数指针，传入`SIG_IGN`表示忽略信号，`SIG_DFL`表示执行默认处理行为;
+
+`sa_mask`: 执行处理函数时要屏蔽的信号集合;
+
+`sa_flags`: 设置为0即可;
+
+有了信号自定义处理描述，接下来介绍如何将`sigaction`结构体和指定的信号绑定，通过`sigaction`函数进行绑定:
+
+```c
+#include <signal.h>
+
+int sigaction(int signo, const struct sigaction* act, struct sigaction* oact);
+```
+
+`sigaction`函数可以读取和修改与指定信号相关联的处理动作。调用成功返回0，出错返回-1；
+
+`signo`: 要绑定的信号编号;
+
+`act`: 要绑定的信号处理行为;
+
+`oact`: 用于传出该信号原来的处理行为;
+
+编写一个简单的测试案例:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <signal.h>
+
+/**
+ * 自定义 SIGINT 信号处理函数
+ * @param sig_no 触发的信号值
+ */
+void handler(int sig_no){
+    printf("触发了 %d 信号，不会终止进程哦~\n",sig_no);
+}
+
+int main() {
+    // 自定义信号处理行为
+    struct sigaction custom_action;
+    custom_action.sa_handler = handler; // 执行处理函数地址
+    custom_action.sa_flags = 0;
+
+    // 用于保存信号原来的处理行为信息
+    struct sigaction old_action;
+
+    // 绑定 SIGINT 信号的处理行为
+    if (sigaction(SIGINT, &custom_action, &old_action) == -1){
+        perror("bind SIGINT");
+        exit(1);
+    }
+    // 阻塞程序，测试使用 Ctrl-C 是否可以终止进程.
+    while (1);
+}
+```
+
+运行后使用`Ctrl-C`来终止它试试:
+
+```bash
+$ ./a.out
+^C触发了 2 信号，不会终止进程哦~
+^C触发了 2 信号，不会终止进程哦~
+^C触发了 2 信号，不会终止进程哦~
+```
+
+#### 5.2 pause
+
+```c
+#include <unistd.h>
+
+int pause(void);
+```
+
+`pause`函数将当前进程**阻塞挂起**，直到有信号递达:
+
+- 如果递达的信号处理动作是**终止进程**，则会结束进程，并且`pause`函数没有机会返回，就像执行`exit`函数一样;
+- 如果递达的信号处理动作是**忽略**，进程则继续处于阻塞，`pause`函数不返回;
+- 如果递达的信号处理动作是**被捕捉**后的自定义处理行为函数，则调用对应的处理函数之后返回-1，errno设置为`EINTR`，错误码EINTR表示“被信号中断”，所以pause只有出错的返回值;
+
+#### 5.3 自定义sleep函数
+
+通过`alarm`函数和`pause`函数自定义实现一个`sleep`函数:
+
+```c
+#include <stdio.h>
+#include <unistd.h>
+#include <signal.h>
+#include <stdlib.h>
+
+/**
+ * 自定义 sleep 函数
+ */
+
+/**
+ * 自定义 SIGALRM 信号处理函数
+ * 该函数什么都不做，只用来将进程从内核态切换回用户态
+ */
+void wake_handler(int sig_no){
+    return;
+}
+
+/**
+ * 使当前进程阻塞挂起 second 秒
+ * @param second 要阻塞的时长
+ */
+unsigned int my_sleep(unsigned int second){
+    // 1. 对 SIGALRM 信号进行捕捉处理
+    struct sigaction new_act, old_act;
+    new_act.sa_handler = wake_handler;
+    new_act.sa_flags = 0;
+    sigemptyset(&new_act.sa_mask);
+    if (sigaction(SIGALRM,&new_act,&old_act) == -1){
+        perror("bind SIGALRM");
+        exit(1);
+    }
+
+    // 2. 通知内核，在 second 秒后向该进程发送 SIGALRM 信号
+    alarm(second);
+
+    // 3. 调用 pause 函数阻塞进程，等待信号
+    pause();
+
+    // 4. 判断进程阻塞时长是否达到了 second 秒，
+    // 如果没有则返回剩余的时长
+    // alarm(0) 表示取消之前的定时时长，返回剩余的时间.
+    unsigned int remain = alarm(0);
+
+    // 5. 将SIGALRM 信号的处理还原
+    sigaction(SIGALRM,&old_act,NULL);
+    return remain;
+}
+
+int main(){
+  my_sleep(3);
+}
+```
+
+执行流程:
+
+1. 通过`alarm`函数通知内核在`second`秒后向当前进程发送`SIGALRM`信号。
+2. 调用`pause`等待，内核切换到别的进程运行。
+3. `second`秒后，内核发`SIGALRM`给这个进程。
+4. 从内核态返回这个进程的用户态之前处理未决信号，发现有`SIGALRM`信号，其处理函数是`wake_handler`。
+5. 切换到用户态执行`wake_handler`函数，进入`wake_handler`函数时`SIGALRM`信号被自动屏蔽，从`wake_handler`函数返回时`SIGALRM`信号自动解除屏蔽。然后自动执行系统调用`sigreturn`再次进入内核，再返回用户态继续执行进程的主控制流程（main函数调用的`my_sleep`函数）。
+6. `pause`函数返回-1，然后调用`alarm(0)`取消闹钟，调用`sigaction`恢复`SIGALRM`信号以前的处理动作。
+
+**优化改进**
+
+该函数目前存在一些问题: 系统运行的时序（Timing）并不像我们写程序时所设想的那样。虽然alarm(nsecs)紧接着的下一行就是pause()，但是无法保证pause()一定会在调用alarm(nsecs)之后的nsecs秒之内被调用。由于异步事件在任何时候都有可能发生（这里的异步事件指出现更高优先级的进程），如果我们写程序时考虑不周密，就可能由于时序问题而导致错误，这叫做竞态条件（Race Condition）。
+
+解决方法就是将**解除信号屏蔽**和**挂起进程阻塞**合并成一个原子操作，可以通过`sigsuspend`函数来实现:
+
+```c
+#include <signal.h>
+
+int sigsuspend(const sigset_t *sigmask);
+```
+
+和pause一样，sigsuspend没有成功返回值，只有执行了一个信号处理函数之后sigsuspend才返回，返回值为-1，errno设置为EINTR。
+
+调用sigsuspend时，进程的信号屏蔽字由sigmask参数指定，可以通过指定sigmask来临时解除对某个信号的屏蔽，然后挂起等待，当sigsuspend返回时，进程的信号屏蔽字恢复为原来的值，如果原来对该信号是屏蔽的，从sigsuspend返回后仍然是屏蔽的。
+
+改进版本:
+
+```c
+#include <stdio.h>
+#include <unistd.h>
+#include <signal.h>
+#include <stdlib.h>
+
+/**
+ * 自定义 sleep 函数(优化版)
+ *  函数执行流程:
+ *   1. 设置 SIGALRM 信号的处理函数;
+ *   2. 让当前进程屏蔽 SIGALRM 信号;
+ *   3. 通知内核在n秒后向当前进程发送 SIGALRM 信号;
+ *   4. 使用原子操作，同时执行下面两条操作
+ *     4.1 让当前进程解除 SIGALRM 信号的屏蔽;
+ *     4.2 阻塞挂起当前进程，等待信号的递达;
+ *   5. 接收到 SIGALRM 信号，进程被唤醒, 查看有没有剩余的可阻塞时长
+ *   6. 设置 SIGALRM 信号的处理函数置为默认处理函数;
+ *   7. 恢复进程的信号屏蔽字信息;
+ */
+
+
+// 自定义 SIGALRM 信号处理函数
+// 该函数什么都不做，只用来将进程从内核态切换回用户态
+void wake_handler(int sig_no){
+}
+
+// 使当前进程阻塞挂起 second 秒
+// @param second 要阻塞的时长
+unsigned int my_sleep(unsigned int second){
+    // 1. 对 SIGALRM 信号绑定处理函数
+    struct sigaction new_act, old_act;
+    new_act.sa_handler = wake_handler;
+    new_act.sa_flags = 0;
+    sigemptyset(&new_act.sa_mask);
+    if (sigaction(SIGALRM,&new_act,&old_act) == -1){
+        perror("bind SIGALRM");
+        exit(1);
+    }
+
+    // 2. 屏蔽 SIGALRM 信号
+    sigset_t mask, mask_back, sus_make;
+    sigemptyset(&mask);
+    sigaddset(&mask,SIGALRM);
+    sigprocmask(SIG_BLOCK, &mask, &mask_back);
+
+    // 3. 通知内核，在 second 秒后向该进程发送 SIGALRM 信号
+    alarm(second);
+
+    // 4. 解除 SIGALRM 信号的屏蔽 && 阻塞进程等待有信号递达(注意这是一个原子操作)
+    sus_make = mask_back;
+    sigdelset(&sus_make, SIGALRM);
+    sigsuspend(&sus_make);
+
+    // 5. 判断进程阻塞时长是否达到了 second 秒，
+    // 如果没有则返回剩余的时长
+    // alarm(0) 表示取消之前的定时时长，返回剩余的时间.
+    unsigned int remain = alarm(0);
+
+    // 6. 将SIGALRM 信号的处理行为还原为默认的
+    sigaction(SIGALRM,&old_act,NULL);
+
+    // 7. 恢复进程屏蔽字
+    sigprocmask(SIG_SETMASK, &mask_back, NULL);
+    return remain;
+}
+
+int main(void) {
+    int n = 10;
+    while (n){
+        printf("%d\n",n);
+        n--;
+        my_sleep(1);
+    }
+    return 0;
+}
+```
+
+
+
+#### 5.4 关于SIGCHLD信号
+
+进程一章讲过用`wait`和`waitpid`函数清理僵尸进程，父进程可以阻塞等待子进程结束，也可以非阻塞地查询是否有子进程结束等待清理（也就是轮询的方式）。采用第一种方式，父进程阻塞了就不能处理自己的工作了；采用第二种方式，父进程在处理自己的工作的同时还要记得时不时地轮询一下，程序实现复杂。
+
+其实，每一个子进程终止时都会给父进程发送一个`SIGCHLD`信号，该信号的默认处理动作是**忽略**，父进程可以自定义SIGCHLD信号的处理函数，这样父进程只需专心处理自己的工作，不必关心子进程了，子进程终止时会通知父进程，父进程在信号处理函数中调用wait清理子进程即可。
+
+如下案例:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <unistd.h>
+
+/**
+ * 请编写一个程序完成以下功能：父进程fork出子进程，子进程调用exit(2)终止，父进程自定
+    义SIGCHLD信号的处理函数，在其中调用wait获得子进程的退出状态并打印。
+ */
+
+
+// 自定义子进程终止信号的 处理函数
+void child_handler(int sig_no){
+    int child_status;
+    int child_pid = wait(&child_status);
+    printf("子进程 %d 终止了，终止状态为: %d \n",child_pid, WEXITSTATUS(child_status));
+}
+
+int main() {
+    // 设置 SIGCHLD 信号处理函数
+    struct sigaction act;
+    act.sa_flags = 0;
+    sigemptyset(&act.sa_mask);
+    act.sa_handler = child_handler;
+    sigaction(SIGCHLD, &act, NULL);
+
+    // 创建子进程
+    pid_t pid = fork();
+    switch (pid) {
+        case -1:
+            perror("fork process");
+            return 1;
+        case 0:
+            // child process
+            // 直接终止子进程，以 SIGINT 信号方式终止
+            exit(2);
+        default:
+            // parent process
+            // 3秒后结束程序.
+            sleep(3);
+            break;
+    }
+    return 0;
+}
+
+```
+
 
 
 ## 线程
+
+### 线程的概念
+
+**线程(Thread)**是操作系统能够进行**调度运行**的最小单元。它被包含在**进程**之中，是进程中的实际运行单元。一条线程指的是进程中的一个独立的控制流，一个进程中可以同时存在多个线程，但至少会存在一个**主线程**。每条线程**并行执行**不同的任务。就像操作系统可以同时运行多个进程一样，每个进程中又可以同时运行多个线程。
+
+进程在各自独立的地址空间中运行，而进程中的线程则共享这整片地址空间，因此进程的**数据段(Data Segment)**和**代码段(Text Segment)**都是共享的，如函数、全局变量等等在各线程中都是可以访问调用的，除此之外还**共享**以下进程资源:
+
+- 文件描述符表
+- 每种信号的处理方式(自定义的信号处理函数)
+- 当前工作目录
+- 用户id和组id
+
+但也有一些资源时每个**线程私有的**:
+
+- 线程id
+- 线程上下文信息，记录各种寄存器的值、程序计数器和栈指针,保存在一个`context`结构体中
+- 栈空间
+- errno 变量
+- 信号屏蔽字
+- 调度优先级
+
+线程库的函数是由POSIX标准定义的，所以头文件称之为`pthread.h`，在Linux上该函数库位于`libpthread`共享库中，因此在编译时要加上`-lpthread`参数;
+
+### 线程的创建
+
+```c
+#include <pthread.h>
+
+int pthread_create(pthread_t *thread, 
+                   const pthread_attr_t *attr,
+                   void *(*start_routine) (void *), 
+                   void *arg);
+```
+
+- `thread`: 通过该参数传出线程的id;
+- `attr`: 线程的属性，通常设置为`NULL`;
+- `start_routine`: 这是一个函数指针，也就是创建的线程要执行的任务函数;
+- `arg`: 任务函数的参数;
+
+在一个线程中调用`pthread_create`函数创建**新的线程**后，**当前线程**得到该函数返回值后继续往下执行，而新线程将执行`start_routine`函数，并且将`arg`作为唯一的参数传递给`start_routine`函数。并且将新线程的id写入到`thread`参数所指向的内存单元中。
+
+新线程执行完`start_routine`函数，这个线程就退出了，父线程可以调用`pthread_join`函数来得到`start_routine`函数的返回值，类似于父进程中调用`wait`得到子进程的终止状态。
+
+我们知道进程id的类型是`pid_t`，每个进程的id在整个系统中是唯一的，调用`getpid(2)`可以获得当前进程的id，是一个正整数值。
+
+线程id的类型是`thread_t`，它只在当前进程中保证是唯一的，在不同的系统中`thread_t`这个类型有不同的实现，它可能是一个整数值，也可能是一个结构体，也可能是一个地址，所以不能简单地当成整数用printf打印，调用`pthread_self(3)`可以获得当前线程的id。
+
+创建线程案例:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <unistd.h>
+
+/**
+ * 线程要执行的任务函数
+ * @param msg
+ */
+void* task(void* arg){
+    printf("%s \n", arg);
+    return NULL;
+}
+
+int main() {
+    pthread_t tid; // 用于保存线程的id
+
+    // 创建线程
+    int res_no = pthread_create(&tid, NULL, task, "Hello thread.");;
+    if(res_no){
+        // 错误处理
+      	fprintf(stderr, "thread create: %s \n", strerror(res_no));
+        exit(1);
+    }
+    sleep(1);
+    printf("创建的子线程ID: %d\n", tid);
+    return 0;
+}
+```
+
+然后编译: 
+
+```bash
+$ gcc main.c -lpthread
+$ ./a.out
+```
+
+切记，别忘了加上`-lpthread`选项，否则链接器将会找不到`pthread_create`函数.
+
+在Linux上，`thread_t`类型是一个地址值，属于同一进程的多个线程调用getpid(2)可以得到相同的进程号，而调用`pthread_self(3)`得到的线程号各不相同。
+
+由于`pthread_create`的错误码不保存在`errno`中，因此不能直接用`perror(3)`打印错误信息，可以先用`strerror(3)`把错误码转换成错误信息再打印。
+
+如果进程中的任意一个线程调用了`exit`函数，则整个进程直接终止，由于从main函数return也相当于调用`exit`，为了防止新创建的线程还没有得到执行就终止，我们在main函数return之前延时1秒，这只是一种权宜之计。
+
+### 线程的控制
+
+#### 线程终止
+
+线程的终止方式有如下几种:
+
+- 通过调用`pthread_exit`函数来终止当前线程(主动);
+- 从线程**任务函数**中`return`，或者正常执行结束(主动);
+- 被其他线程通过`pthread_cancel`函数终止(被动);
+- 进程中的任意线程调用`exit`函数，则所有线程终止(主动 Or 被动);
+
+```c
+#include <pthread.h>
+
+void pthread_exit(void* value_ptr);
+```
+
+`pthread_exit`函数用于终止当前线程，`value_ptr`作为线程的返回值存储单元，其他线程可以通过`pthread_join`来获得这个指针;
+
+> **注意:** `pthread_exit`或者return返回的指针所指向的内存单元必须是全局区或者堆区的内存地址，不可以是线程函数栈中的内存。
+
+#### 线程同步
+
+线程之间是并行关系，它们的执行顺序是无法确定的，但是在某些场景下我们需要让它们按照顺序执行，这时候就需要同步机制。
+
+```c
+#include <pthread.h>
+
+int pthread_join(pthread_t thread, void** value_ptr);
+```
+
+- `thread`: 要等待结束的线程的id;
+- `value_ptr`: 结束线程的返回值的指针;
+
+调用`pthread_join`函数会将**当前线程阻塞挂起**，直到id为`thread`的线程终止之后才会继续执行。
+
+线程被终止的方式不同，终止状态也会存在差异，规则如下:
+
+1. 如果线程通过`return`关键字终止，`value_ptr`则指向线程的**任务函数**的返回值指针;
+2. 如果线程被别的线程通过`pthread_cancel`异常终止，`value_ptr`则指向常量`PTHREAD_CANCELED`;
+3. 如果线程通过主动调用`pthread_exit`终止，`value_ptr`则指向`pthread_exit`函数中的`value_ptr`参数地址;
+
+如果对线程的终止状态不感兴趣，可以将`NULL`作为`value_ptr`参数传入;
+
+成功返回0，错误则返回错误码;
+
+**案例一:**
+
+```c
+#include <stdio.h>
+#include <pthread.h>
+#include <string.h>
+#include <stdlib.h>
+
+/**
+ * 方式一: 线程通过 return终止方式;
+ */
+
+// 线程函数
+void* task(void* arg){
+    printf("new thread running task \n");
+    printf("task arg: %d \n",arg);
+    return (void*)200;
+}
+
+int main() {
+    // 线程id
+    pthread_t threadId;
+    // 创建线程
+    int errno = pthread_create(&threadId, NULL, task, (void*)100);
+    if(errno){
+        fprintf(stderr,"create thread failed: %s \n", strerror(errno));
+        exit(errno);
+    }
+
+    // 等待线程结束，并且获取线程执行的函数返回值
+    void* res;
+    errno = pthread_join(threadId, &res);
+    if(errno){
+        fprintf(stderr,"join thread failed: %s \n", strerror(errno));
+        exit(errno);
+    }
+    printf("new thread stop res: %d \n", (int)res);
+    return 0;
+}
+```
+
+执行结果:
+
+```bash
+new thread running task
+task arg: 100
+new thread stop res: 200
+```
+
+**案例二:**
+
+```c
+#include <stdio.h>
+#include <pthread.h>
+#include <string.h>
+#include <stdlib.h>
+/**
+ * 方式二: 线程通过 pthread_exit方式终止;
+ */
+
+// 线程函数
+void* task(void* arg){
+    printf("new thread running task \n");
+    printf("task arg: %d \n",arg);
+
+    // TODO 通过 pthread_exit 终止线程，并且传出返回值指针
+    pthread_exit((void*) 200);
+}
+
+int main() {
+    // 线程id
+    pthread_t threadId;
+    // 创建线程
+    int errno = pthread_create(&threadId, NULL, task, (void*)100);
+    if(errno){
+        fprintf(stderr,"create thread failed: %s \n", strerror(errno));
+        exit(errno);
+    }
+
+    // 等待线程结束，并且获取线程执行的函数返回值
+    void* res;
+    errno = pthread_join(threadId, &res);
+    if(errno){
+        fprintf(stderr,"join thread failed: %s \n", strerror(errno));
+        exit(errno);
+    }
+    printf("new thread stop res: %d \n", (int)res);
+    return 0;
+}
+```
+
+执行结果:
+
+```bash
+new thread running task
+task arg: 100
+new thread stop res: 200
+```
+
+**案例三:**
+
+```c
+#include <stdio.h>
+#include <pthread.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+/**
+ * 方式三: 被其他线程通过 pthread_cancel 函数终止;
+ */
+
+// 线程函数
+void* task(void* arg){
+    printf("new thread running task \n");
+    // 手动进入死循环
+    int sec = 0;
+    while (1){
+        printf("new thread sleep %d sec. \n", ++sec);
+        sleep(1);
+    }
+}
+
+int main() {
+    // 线程id
+    pthread_t threadId;
+    // 创建线程
+    int errno;
+    if((errno = pthread_create(&threadId, NULL, task, NULL))){
+        fprintf(stderr,"create thread failed: %s \n", strerror(errno));
+        exit(errno);
+    }
+
+    sleep(3);
+    // TODO 中断线程
+    // 三秒后，主线程通过 pthread_cancel 主动打断新线程的运行
+    if ((errno = pthread_cancel(threadId))){
+        fprintf(stderr,"cancel thread failed: %s \n", strerror(errno));
+        exit(errno);
+    };
+
+    // TODO  等待线程结束，并且获取线程执行的函数返回值
+    void* res;
+    if((errno = pthread_join(threadId, &res))){
+        fprintf(stderr,"join thread failed: %s \n", strerror(errno));
+        exit(errno);
+    }
+    if (res == PTHREAD_CANCELED){
+        // 线程是被其他线程取消的
+        printf("new thread is cancel res: %d \n",(int)res);
+    }
+    return 0;
+}
+```
+
+执行结果:
+
+```bash
+new thread running task
+new thread sleep 1 sec.
+new thread sleep 2 sec.
+new thread sleep 3 sec.
+new thread sleep 4 sec.
+new thread is cancel res: 1
+```
+
+在Linux的`pthread`库中常数`PTHREAD_CANCELED`的值为`-1`:
+
+```c
+#define PTHREAD_CANCELED 		((void *) -1)
+```
+
+而在MacOS中值为`1`:
+
+```c
+#define PTHREAD_CANCELED	  ((void *) 1)
+```
+
+一般情况下，线程终止后，其终止状态一直保留到其它线程调用`pthread_join`获取它的状态为止。但是线程也可以被置为**detach状态**,这样的线程一旦终止就立刻回收它占用的所有资源，而不保留终止状态。所以不能对一个已经处于**detach状态**的线程调用`pthread_join`这样的调用将返回`EINVAL`。
+
+对一个尚未**detach**的线程调用`pthread_join`或`pthread_detach`都可以把该线程置为**detach状态**,也就是说，不能对同一线程调用两次`pthread_join`，或者如果已经对一个线程
+调用了`pthread_detach`就不能再调用`pthread_join`了。
+
+```c
+#include <pthread.h>
+
+int pthread_detach(pthread_t tid);
+```
+
+成功返回0，失败返回错误码;
+
+#### Mutex
+
+多个线程同时对**共享数据**进行修改时可能会产生冲突，从而导致数据的不稳定性，这跟前面讲到的信号的可重入性是同样的问题。
+
+如下案例:
+
+```c
+#include <pthread.h>
+#include <stdio.h>
+
+int counter = 0;
+
+// 对 counter 自增,循环5000次
+void* add(void *arg) {
+  for (int i = 0; i < 5000; i++) {
+    counter++;
+  }
+  return NULL;
+}
+
+int main() {
+    // 启用两个线程，分别执行 add 函数
+    pthread_t t1, t2;
+    pthread_create(&t1, NULL, add, NULL);
+    pthread_create(&t2, NULL, add, NULL);
+    // 等待两个线程结束
+    pthread_join(t1,NULL);
+    pthread_join(t2,NULL);
+    // 输出结果值
+    printf("counter: %d \n", counter);
+    return 0;
+}
+
+```
+
+编译后运行，多运行几次，你会发现`counter`的值是不稳定的:
+
+```bash
+$ gcc main.c -lpthread
+$ ./a.out
+counter: 10000
+$ ./a.out
+counter: 10000
+$ ./a.out
+counter: 5349
+$ ./a.out
+counter: 9833
+```
+
+原因也很简单: `a++`这行代码最终会被拆解成三条指令，并不是一个**原子操作**。
+
+那么如何解决？最普遍的方式就是引入**互斥锁(Mutex Lock)**，简单来说就是把可能存在发生冲突的**共享资源**和一把锁关联起来，只有拿到这把锁才能访问该资源，但是由于这把锁只存在一把，所以最多只能有一个人同时访问该资源，其他人只能选择排队。
+
+Mutex使用`pthread_mutex_t`类型表示，表示为一把互斥锁;
+
+##### 初始化Mutex
+
+```c
+#include <pthread.h>
+
+int pthread_mutex_init(pthread_mutex_t* mutex, const pthread_mutexattr_t* attr);
+# 返回值：成功返回0，失败返回错误号。
+```
+
+`pthread_mutex_init`函数用于对`pthread_mutex_t`进行初始化。`attr`参数是设定Mutex的属性，一般设置为`NULL`即可;
+
+如果Mutex是**全局变量**或者**静态变量**，也可以直接使用宏定义`PTHREAD_MUTEX_INITIALIZER`来初始化，如下两种初始化方式:
+
+```c
+#include <pthread.h>
+
+// 全局互斥锁
+pthread_mutex_t lock1 = PTHREAD_MUTEX_INITIALIZER;
+
+int main(){
+  // 局部互斥锁
+  pthread_mutex_t lock2;
+  pthread_mutex_init(&lock2, NULL);
+}
+```
+
+##### 销毁Mutex
+
+Mutex也可以销毁，通过`pthread_mutex_destroy`函数销毁:
+
+```c
+#include <pthread.h>
+
+int pthread_mutex_destroy(pthread_mutex_t *mutex);
+# 
+```
+
+##### 加锁
+
+```c
+#include <pthread.h>
+
+int pthread_mutex_lock(pthread_mutex_t *mutex);
+int pthread_mutex_trylock(pthread_mutex_t *mutex);
+# 返回值：成功返回0，失败返回错误号
+```
+
+`pthread_mutex_lock`会一直阻塞着，直到获取到锁;
+
+`pthread_mutex_trylock`会尝试获取锁，不管能不能拿到锁都会立即返回;
+
+##### 解锁
+
+```c
+#include <pthread.h>
+
+int pthread_mutex_unlock(pthread_mutex_t *mutex);
+# 返回值：成功返回0，失败返回错误号
+```
+
+接下来使用Mutex来解决上一个问题:
+
+```c
+#include <stdio.h>
+#include <pthread.h>
+#include <string.h>
+
+/**
+ * 使用 Mutex 实现 多线程的同步
+ */
+
+// 共享资源
+int counter = 0;
+/// 定义并且初始化互斥锁
+pthread_mutex_t counter_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// 对 counter 自增,循环5000次
+void* add(void *arg) {
+    pthread_mutex_init(&counter_lock, NULL);
+    for (int i = 0; i < 5000; i++) {
+        /// 加锁
+        int errno = pthread_mutex_lock(&counter_lock);
+        if(errno != 0){
+            // 加锁失败
+            fprintf(stderr,"lock failed: %s \n",strerror(errno));
+        }
+
+        /// 操作共享数据
+        counter++;
+
+        /// 解锁
+        errno = pthread_mutex_unlock(&counter_lock);
+        if(errno != 0){
+            // 解锁失败
+            fprintf(stderr,"unlock failed: %s \n",strerror(errno));
+        }
+    }
+    return NULL;
+}
+
+int main() {
+    // 启用 10 个线程测试
+    pthread_t tids[10];
+    for (int i = 0; i < 10; i++) {
+        pthread_create(&tids[i], NULL, add, NULL);
+    }
+    pthread_mutex_init();
+
+    // 等待10个线程全部结束
+    for (int i = 0; i < 10; i++) {
+        pthread_join(tids[i], NULL);
+    }
+
+    // 销毁互斥锁
+    pthread_mutex_destroy(&counter_lock);
+
+    // 输出总结果
+    printf("counter: %d \n", counter);
+    return 0;
+}
+```
+
+如果程序正确，那么结果应该总是 50000~
+
+##### 补充
+
+Mutex的两个基本操作lock和unlock是如何实现的呢？
+
+假设Mutex变量的值为`0`表示互斥锁空闲，这时某个进程调用lock可以获得锁，而Mutex的值为0表示互斥锁已经被某个线程获得，其它线程再调用lock只能挂起等待。那么lock和unlock的伪代码如下：
+
+```c
+// 加锁
+lock: 
+	if(mutex == 0){
+    mutex = 1;
+  }else{
+    // 阻塞等待，直到被其他线程唤醒;
+		goto lock;
+  }
+
+// 解锁
+unlock:
+	mutex = 0;
+	... // 唤醒其他阻塞等待的线程
+```
+
+unlock操作中唤醒等待线程的步骤可以有不同的实现，可以只唤醒一个等待线程，也可以唤醒所有等待该Mutex的线程，然后让被唤醒的这些线程去竞争获得这个Mutex，竞争失败的线程继续挂起等待。
+
+细心的读者应该已经看出问题了：对Mutex变量的读取、判断和修改不是原子操作。如果两个线程同时调用lock，这时Mutex是0，两个线程都判断mutex==0成立，然后其中一个线程置mutex=1，而另一个线程并不知道这一情况，也置mutex=1，于是两个线程都以为自己获得了锁。
+
+为了实现互斥锁操作，大多数体系结构都提供了`swap`或`exchange`指令，该指令的作用是把寄存器和内存单元的数据相交换，由于只有一条指令，保证了原子性，即使是多处理器平台，访问内存的总线周期也有先后，一个处理器上的交换指令执行时另一个处理器的交换指令只能等待总线周期。
+
+“挂起等待”和“唤醒等待线程”的操作如何实现？每个Mutex有一个等待队列，一个线程要在Mutex上挂起等待，首先在把自己加入等待队列中，然后置线程状态为睡眠，然后调用调度器函数切换到别的线程。一个线程要唤醒等待队列中的其它线程，只需从等待队列中取出一项，把它的状态从睡眠改为就绪，加入就绪队列，那么下次调度器函数执行时就有可能切换到被唤醒的线程。
+
+**死锁**
+
+一般情况下，如果同一个线程先后两次调用lock，在第二次调用时，由于锁已经被占用，该线程会挂起等待别的线程释放锁，然而锁正是被自己占用着的，该线程又被挂起而没有机会释放锁，因此就永远处于挂起等待状态了，这叫做死锁（Deadlock）。另一种典型的死锁情形是这样：线程A获得了锁1，线程B获得了锁2，这时线程A调用lock试图获得锁2，结果是需要挂起等待线程B释放锁2，而这时线程B也调用lock试图获得锁1，结果是需要挂起等待线程A释放锁1，于是线程A和B都永远处于挂起状态了。
+
+#### Condition
+
+如果我们需要多个线程之间交替执行，根据某个条件是否成立协调各个线程的执行，就需要通过**条件变量(Condition Variable)**来实现，简单点说就是，**Condition**可以让**Mutex**的同步粒度更细一些，做到一些更精准的操作。最典型的就是**生产者与消费者模型**。
+
+**Condition**使用`pthread_cond_t`类型来表示，可通过以下两个方法来进行初始化和销毁:
+
+```c
+#include <pthread.h>
+
+int pthread_cond_init(pthread_cond_t* cond, const pthread_condattr_t* attr);
+int pthread_cond_destroy(pthread_cond_t *cond);
+# 成功返回0，失败返回错误号。
+```
+
+如果Condition是静态分配的，也可以使用宏定义来初始化:
+
+```c
+pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+```
+
+Condition Variable的操作函数有如下:
+
+```c
+#include <pthread.h>
+
+int pthread_cond_wait(pthread_cond_t* cond, pthread_mutex_t* mutex);
+int pthread_cond_timedwait(pthread_cond_t* cond, pthread_mutex_t* mutex, const struct timespec* abstime);
+# 成功返回0，失败返回错误号。
+```
+
+`pthread_cond_wait`: 释放Mutex，并且挂起阻塞当前线程，等待唤醒;
+
+`pthread_cond_timedwait`: 同上，但是可以指定超时时间，一旦超过这个时间没有被唤醒，则返回`ETIMEDOUT`;
+
+```c
+#include <pthread.h>
+
+int pthread_cond_broadcast(pthread_cond_t *cond);
+int pthread_cond_signal(pthread_cond_t *cond);
+# 成功返回0，失败返回错误号。
+```
+
+`pthread_cond_signal`: 唤醒阻塞在`cond`上的某一个等待线程;
+
+`pthread_cond_broadcast`: 唤醒阻塞在`cond`上的所有等待线程;
+
+生产者消费者案例:
+
+```c
+#include <stdio.h>
+#include <pthread.h>
+#include <unistd.h>
+
+/**
+ * 通过 Mutex 和 Condition 实现一个生产者消费者模型
+ */
+
+
+// ============== 共享资源 ================
+int cakeCount = 0;    // 当前蛋糕数量
+int maxCakeCount = 10;// 最大蛋糕数量
+int producerSum = 0; // 共生产的蛋糕数量
+int consumerSum = 0; // 共消费的蛋糕数量
+// ======================================
+
+// ============= 同步工具 =================
+// 互斥锁
+pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+// 条件变量
+pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+// =======================================
+
+/**
+ * 生产者线程函数
+ */
+void* producerTask(void* arg){
+    // 加锁
+    pthread_mutex_lock(&lock);
+    // 生产蛋糕
+    while (1){
+        if(cakeCount >= maxCakeCount){
+            // 已到达最大数量，无法继续生产
+            // 唤醒消费者
+            pthread_cond_signal(&cond);
+            if(producerSum == 20){
+                // 停止生产者
+                printf("生产者生成完成20个蛋糕，结束!\n");
+                break;
+            }
+            printf("蛋糕已满，不能继续生产，唤醒消费者! \n");
+            // 阻塞生产者
+            pthread_cond_wait(&cond, &lock);
+        }
+        cakeCount++;
+        producerSum++;
+        printf("生产者生成了1个蛋糕，当前蛋糕数量: %d，共生产蛋糕数量: %d \n",cakeCount,producerSum);
+        sleep(1);
+    }
+    // 解锁
+    pthread_mutex_unlock(&lock);
+}
+
+/**
+ * 消费者线程函数
+ */
+void* consumerTask(void* arg){
+    // 加锁
+    pthread_mutex_lock(&lock);
+    // 消费蛋糕
+    while (1){
+        if(cakeCount <= 0){
+            // 没有蛋糕了，无法继续消费
+            // 唤醒生产者
+            pthread_cond_signal(&cond);
+            if(consumerSum == 20){
+                printf("消费者共消费蛋糕数量: %d，结束!\n",consumerSum);
+                break;
+            }
+            printf("没有蛋糕了，唤醒生产者!\n");
+            // 阻塞消费者
+            pthread_cond_wait(&cond,&lock);
+        }
+        cakeCount--;
+        consumerSum++;
+        printf("消费者消费了1个蛋糕，当前蛋糕数量: %d，共消费蛋糕数量: %d\n",cakeCount,consumerSum);
+        sleep(1);
+    }
+    // 解锁
+    pthread_mutex_unlock(&lock);
+}
+
+int main() {
+    pthread_t producer, consumer;
+    // 开启生产者
+    pthread_create(&producer, NULL, producerTask, NULL);
+    // 开启消费者
+    pthread_create(&consumer, NULL, consumerTask, NULL);
+
+    pthread_join(producer,NULL);
+    pthread_join(consumer,NULL);
+    return 0;
+}
+```
+
+#### Semaphore
+
+刚刚学完的**Mutex(互斥)**机制可以保证同一时间**仅有一个**线程能访问指定的**共享资源**，而**Semaphore(信号量)**机制可以保证同一时间有**限定数量**的线程访问共享资源。
+
+简单点说就是**Mutex**变量是非0即1的，默认为1，表示有一个可用资源，加锁后则变为0，表示没有资源可用。而**Semaphore**的可用资源数量可以大于1.
+
+而且，**Semaphore**不仅可以用于线程间的同步，还可以实现进程间的通信。
+
+**Semaphore**变量的类型为`sem_t`。
+
+##### 初始化和销毁
+
+初始化函数:
+
+```c
+#include <semaphore.h>
+
+int sem_init(sem_t *sem, int pshared, unsigned int value);
+```
+
+- `sem`： 要初始化的信号量变量;
+- `value`: 表示该信号量可用的资源数量;
+- `pshared`: 设置为0表示线程同步，1表示为进程同步;
+
+销毁函数:
+
+```c
+#include <semaphore.h>
+
+int sem_destroy(sem_t * sem);
+```
+
+在用完semaphore变量之后应该调用sem_destroy()释放与semaphore相关的资源。
+
+##### 阻塞与唤醒
+
+```c
+#include <semaphore.h>
+
+int sem_wait(sem_t *sem);
+int sem_trywait(sem_t *sem);
+int sem_post(sem_t * sem);
+```
+
+`sem_wait`: 获取信号量资源，使`semaphore`的值减1，如果当前已经没有可用资源，则挂起等待。
+
+`sem_wait`: 尝试获取信号量资源，没有可用资源则直接返回。
+
+`sem_post`: 释放信号量资源，使`semaphore`的值加1，同时唤醒其他等待的线程;
+
+
 
 ## Shell编程
 
@@ -2891,11 +3959,471 @@ hello             world
 
  
 
+## 网络通信
+
+### 1.协议的概念
+
+> 协议是双方共同制定的一组规则，双方都按照这组规则来对数据进行编码和解码，在网络通信中，协议是一个非常重要的概念。
+
+### 2.OSI七层模型
+
+**OSI(Open System Interconnection)**意为开放式系统互联，是计算机网络体系结构的标准化框架。该模型分为七层，用于描述和理解计算机网络中不同层次之间的通信，它由国际标准化组织(ISO)在20世纪80年代制定，旨在帮助不同厂商的计算机系统能够相互通信和协作。
+
+这个模型将网络通信划分为七个不同的层次，每个层次负责不同的功能和任务:
+
+- **物理层**
+
+  物理传输媒介，负责传输原始比特流，进行数模转换与模数转换。如**电缆、双绞线和光纤**等都属于物理层。
+
+- **数据链路层**
+
+  负责数据传校验，将要传输的数据打包成网络传输的基本单位-**以太网帧**，以便物理媒介上传输，也就是**以太网协议**。
+
+- **网络层**
+
+  负责路由找到目标网络，实现不同网络之间建立**点对点**的传输，并且完成数据的传输和转发，也就是**IP协议**。
+
+- **传输层**
+
+  负责两台计算机之间的**端对端**的传输，提供数据传输的流量控制，如**TCP、UDP协议**。
+
+- **会话层**
+
+  负责建立、管理和终止会话连接，提供数据交换的会话控制。
+
+- **表示层**
+
+  负责数据格式的转换、加密和压缩，提供数据的解码和编码，如JPEG、ASCII等。
+
+- **应用层**
+
+  负责为用户提供网络服务和应用程序的接口，实现特定的网络应用功能，如**HTTP**、**FTP**、**SMTP、QUIC**等协议。
+
+### 3.TCP/IP模型
+
+**OSI**是一种理论下的模型，而**TCP/IP**已被广泛使用，成为网络互联事实上的标准。**TCP/IP**简化为了四层模型:
+
+- **网络接口层**: 对应OSI中的**物理层**和**数据链路层**。
+- **网络层**
+- **传输层**
+- **应用层**: 对应OSI中的**会话层**、**表示层**和**应用层**。
+
+与OSI的对应关系如下:
+
+| OSI七层网络模型       | TCP/IP四层概念模型 | 对应网络协议                   |
+| :-------------------- | :----------------- | :----------------------------- |
+| 应用层(Application)   | 应用层             | HTTP、TFTP、FTP、NFS、SMTP     |
+| 表示层(Presentation)  |                    | Telnet、Rlogin、SNMP、Gopher   |
+| 会话层(Session)       |                    | SMTP、DNS                      |
+| 传输层(Transport)     | 传输层             | TCP、UDP                       |
+| 网络层(Network)       | 网络层             | IP、ICMP、ARP、RARP、AKP、UUCP |
+| 数据链路层(Data Link) | 网络接口层         | FDDI、Ethernet、Arpanet、PDN   |
+| 物理层(Physical)      |                    |                                |
 
 
-## 网络编程
+
+![](../asstes/1.9OSI和TCPIP模型图.png)
+
+### 4.网络传输流程
+
+下面通过一张图来简述，网络通信的整体流程:
+
+![](../asstes/1.10网络通信流程.png)
+
+**发送端**
+
+一个数据载体(Payload)由上至下，经过各层的添砖加瓦，将各自使用的**协议(Protocol)**头部添加到数据头，最终被打包成了**以太网帧**，由物理层传输出去。
+
+**接收端**
+
+将接受到的**以太网帧**由下之上，被各层进行层层解包(移除掉自己的协议头部信息)，最终被还原成了**数据载体**。
+
+### 5.应用程序架构
+
+**C/S模式**
+
+传统的网络应用程序设计架构，也就是Client(客户端)/Serve(服务器)架构。为用户提供部署客户端来和服务端来进行通信。
+
+**B/S模型**
+
+Browser(浏览器)/Server(服务端)架构。不需要专门开发客户端程序来和服务端进行通信，而是使用浏览器充当客户端，来和服务端进行通信，一般采用HTTP/HTTPS协议。
+
+**优缺点:**
+
+- B/S: 轻松实现跨平台，维护成本低，但是需要考虑兼容性问题。
+- C/S: 开发成本较高，需要单独维护客户端程序的开发，但是扩展性强，性能可以根据需要优化。
+
+### 6.协议格式详解
+
+#### 1.以太网帧
+
+**以太网帧**就是数据被各层加工后形成的一种能够在网络中传输的数据包，在**网络接口层(数据链路层)**形成，它的格式如下:
+
+![](../asstes/1.11以太网帧格式.png)
+
+具体分为三大部分:
+
+- **帧头部**
+
+  - **目的地址**: 目标计算机的MAC地址，占6个字节。
+  - **源地址**: 当前计算机的MAC地址，占6个字节。
+  - **类型**: 指定网络层使用的协议类型，以及数据体的长度。通常是`0x0800`，表示IP协议。
+    - `0x0800`: 表示IP协议，数据体的长度范围为 46~1500。
+    - `0x0806`: 表示ARP协议，数据体的长度为46。
+    - `0x8035`: 表示RARP协议，数据体的长度为46。
+
+- **数据体**
+
+  包含了更上层协议的数据信息，如IP协议的信息。
+
+- **帧尾**
+
+  帧尾是以太网帧的最后部分，用于标识帧的结束。它包含了一个帧校验序列（FCS），通常使用循环冗余检查（CRC）算法计算得出。帧校验序列用于检测在传输过程中是否发生了数据损坏。帧尾的长度为4个字节。
+
+一个**以太网帧**的体积范围为**(64~1518)**个字节，帧头部固定为**14**个字节，帧尾固定为**4**个字节，数据体大小范围为**(46~1500)**，取决于网络层的协议类型。
+
+当**帧头部**的**类型**不同时，那么数据体的内容和长度也会有所不同，如**类型**为`0x0800`时，则采用的是**IP协议**，数据体的体量较为大一些。
+
+<img src="../asstes/1.12以太网帧格式-IP协议.png" style="zoom:50%;" />
+
+类型为`0x0806`时，采用ARP协议，数据体的体积会相对于较小:
+
+<img src="../asstes/1.13以太网帧格式-ARP协议.png" style="zoom:50%;" />
+
+类型为`0x8035`时，表示采用RARP协议:
+
+<img src="../asstes/1.14以太网帧格式-RARP协议.png" style="zoom:50%;" />
+
+**PAD**是因为数据体长度不够**46**，所以进行填充补位。
+
+#### 2.ARP协议
+
+**ARP(Address Resolution Protocol，地址解析协议)**是一种网络层的协议，用于将IP地址映射到MAC地址。在计算机网络中，当一台设备需要与另一台设备通信时，它需要知道目标设备的MAC地址才能将数据帧发送到正确的位置。ARP协议就是解决这个问题的。
+
+具体来说，当一台设备知道目标设备的IP地址但不知道其MAC地址时，它会发送一个ARP请求广播消息到网络上，询问该IP地址对应的MAC地址。目标设备收到这个ARP请求后，会发送一个ARP响应消息，包含自己的MAC地址。发送ARP请求和响应的过程中使用的是广播，因此所有连接到同一网络的设备都会收到这些消息。一旦发送设备收到了目标设备的MAC地址，它就可以将数据帧发送到目标设备了。
+
+当发送方不知道目标设备的MAC地址时，它会将目标设备的IP地址作为目标MAC地址设置为广播地址（全为1的MAC地址，通常表示为FF:FF:FF:FF:FF:FF）。这样做的目的是将数据帧发送到网络上的所有设备，以便目标设备能够接收到该数据帧。当网络上的设备收到这个数据帧时，它们会检查数据帧中的目标MAC地址是否与自己的MAC地址匹配。如果匹配则进行ARP响应，如果不匹配，则会丢弃该数据帧。
+
+简单来说就是: 根据ARP协议可以根据一个计算机的IP地址，获取到它的MAC地址。
+
+下面是一个采用ARP协议的以太网帧的结构图:
+
+<img src="../asstes/1.15ARP协议格式.png" style="zoom:50%;" />
+
+ARP报文包含如下几部分:
+
+1. **硬件类型**
+
+2. **协议类型**
+
+3. **硬件类型长度**
+
+4. **协议地址长度**
+
+5. **OP** - 表示是请求还是应答，1表示请求，2表示应答。
+6. **发送端MAC地址**
+7. **发送端IP地址**
+8. **目标MAC地址**
+9. **目标IP地址**
+
+ARP请求和应答报文具体格式如下:
+
+<img src="../asstes/1.16ARP请求与应答.png" style="zoom:100%;" />
+
+1. 源主机通过目标主机的IP地址，对网络发起ARP广播请求，由于不知道目标MAC地址，所以设置为`ff:ff:ff:ff:ff:ff`。
+2. 当网络中的目标主机收到这个帧后，检查帧中的目标IP地址是否与自己的IP地址匹配，如果匹配则对该源主机发起ARP应答。
+3. 源主机收到目标主机的ARP应答报文，从中获取到源MAC地址。
+
+#### 3.IP协议
+
+**IP协议**也是位于网络层的通信协议，通常传输具体的数据就是采用IP协议，格式结构图如下:
+
+<img src="../asstes/1.17IP协议格式.png" style="zoom:40%;" />
+
+结构分为三大部分:
+
+- **头部(20字节)**
+
+  - **协议版本**
+
+    描述当前IP协议版本。占4位。
+
+    - `0x0100`: 表示IPv4版本;
+    - `0x0110`: 表示IPv6版本;
+
+  - **首部长度**
+
+    描述IP报文头部的长度，占4位。因为在IP包头中有变长的可选部分因此其取值范围是0到15，但是通常最小设置为`0x0101`(5)。
+
+    所以头部最大长度为60字节(15 * 4)，最小为20字节(5 * 4)。
+
+  - **服务类型**: 指定IP数据报的处理优先级和服务质量，占8位(1个字节)。
+
+  - **数据总长度**: 指IP报文的总长度(包含头部长度)，具体的**数据长度** = **数据总长度** - **头部长度**。占16位(2个字节)，最大值为65535。
+
+  - **标识**
+
+    一个IP报文的唯一标识，通常每发一份报文，它的值会加1。占16位(2个字节)。当一个数据包较大时，可以被分割成多个较小的数据包，然后逐个发送，每个数据包都持有相同的报文标识。注意，是分割数据包，并不是指发送多份报文的意思!
+
+  - **标志**
+
+    用于控制帧的分片行为，该值占3位，每位分别表示如下含义:
+
+    - 第一位: 保留位，默认都是0。
+    - 第二位: 是否允许分片，设置为1表示不允许分片。如`010`表示为不允许分片。
+    - 第三位: 当帧被分片处理后，设置为1表示是分片数据，设置为0表示这是报文的最后一个分片。如`100`表示还有未接收的分片数据，而`000`则表示为最后一片分片数据。
+
+  - **片移量**:  记录当前分片在原始报文中的偏移量，占13位。因此最大的偏移量为2^13 - 1，即8191个8字节的单位，也就是65,528字节。
+
+  - **TTL**: IP报文最大存活时间，当源主机产生一个IP报文后，该字段会填写一个初始值，随后该报文每经过一个路由器该值则减1，当值变为0后，则丢弃该报文，防止引起网络阻塞。
+
+  - **协议类型**: 用于指定传输层使用的协议类型，占8位(1个字节):
+
+    - `0x01`: ICMP
+
+    - `0x0`: IGMP
+    - `0x06`: TCP
+    - `0x11`: UDP
+
+  - **首部校验和**: 用来做IP头部的正确性检测，但不包含数据部分,占16位(2个字节)。 因为每个路由器要改变TTL的值,所以路由器会为每个通过的数据包重新计算这个值。
+
+  - **源IP地址**: 报文的发送端IP地址(4字节);
+
+  - **目标IP地址**: 报文的接收端IP地址(4字节);
+
+- **选项填充(8字节)**
+
+  可变长且最大不超过40字节;
+
+- **数据**: 
+
+  更上层的协议数据，如TCP、UDP等协议信息;
+
+> **补充**: 很多服务都有固定的端口号，然后客户端程序并不需要指定端口号，而是每次运行时由操作系统自动分配一个空闲的端口号，用完就释放掉，称之为ephemeral的端口号。
+
+#### 4.UDP协议
+
+UDP协议是位于传输层的传输协议，它是非面向连接的，效率很块，但是无法保证可靠性。
+
+<img src="../asstes/1.18UDP协议格式.png" style="zoom:40%;" />
+
+- **头部(8字节)**
+  - **源端口**: 发送端的进程端口号(2字节)，范围是0 - 2^16 - 1，其中1 ~ 1023端口被很多软件固定占用。
+  - **目标端口**: 接收端的进程端口号(2字节)。
+  - **UDP报文长度**: UDP报文的总长度(头部长度 + 数据长度)(2字节)。
+  - **校验和**: 此字段用来校验数据是否出错。(2字节)。
+- **数据**
+
+**UDP协议的特点:**
+
+1. 不需要建立连接，无状态连接;
+
+2. 传输效率快;
+
+3. 无法保证传输的可靠性和顺序性;
+
+发送端的UDP协议层只负责把应用层传来的数据封装成段交给网络层就算完成任务，如果因为网络层故障导致该段无法发送出去，UDP也不会给应用层任何反馈。接受端的UDP协议层只负责把收到的数据包解析后根据端口号交给对应的应用程序就算完成任务。
+
+如果发送端发来多个数据包并且在网络上经过不同的路由，到达接收端时顺序已经错乱了，那么UDP也不保证按照发送出的顺序交给应用，遵循先来后到的原则。
+
+产生数据丢失的情况:
+
+通常接收端的UDP协议会将受到的数据放在一个固定大小的缓冲区，然后等待应用程序来提取和处理，如果应用程序提取和处理的速度很慢，而发送端的发送速度太快，导致缓冲区已满，那么新的数据包就一会直接丢掉，从而产生丢失数据包。
+
+如果接收端的缓冲区太小，但无法容纳整个数据包，那么缓冲区就会截断数据包，只留下刚好与缓冲区齐平那部分，超出的部分将会丢掉，从而产生丢失数据包。
+
+> 总的来说，UDP协议不提供**流量控制**或**拥塞控制**机制，因此在UDP通信中，应用程序需要自行处理数据包的丢失或截断情况。
+
+#### 5.TCP协议
+
+TCP是互联网中应用最广泛的协议，一切皆TCP！
+
+<img src="../asstes/1.19TCP协议格式.png" style="zoom:40%;" />
+
+TCP报文整体分为两大部分，细分可分为三大部分: 协议头部、选项(可有可无)、数据载荷。
+
+- **头部(20字节)**
+
+  TCP头部占20个固定字节，分为如下部分:
+
+  - **源端口**: 发送端的进程端口号(2字节);
+
+  - **目标端口**: 接收端的进程端口号(2字节);
+
+  - **序号**: 当前报文的唯一序号(4字节);
+
+  - **确认号**
+
+    用于回应发送端的确认号(4字节)，通常和发送端上一条报文的**序号**有着密切的关系: `当前报文的确认号 = 接收的上一条报文的序号 + 1`;
+
+    **序号**和**确认号**在TCP中扮演者非常重要的角色: 它们的作用有如下:
+
+    1. 确认号指示了接收端期望接收的下一个字节的序号。通过确认号，接收端告知发送端，它已经成功接收并正确处理了确认号之前的所有数据。
+    2. 确认号与序号配合使用，帮助发送端确定哪些数据已经成功传输到接收端。发送端可以根据确认号来更新其发送窗口，从而继续发送未确认的数据。
+    3. 确认号还用于流量控制。接收端可以通过确认号告知发送端它的可用接收缓冲区大小，从而控制发送端的发送速率，防止发送端发送过多数据导致接收端缓冲区溢出。
+    4. 确认号也在拥塞控制中扮演重要角色。发送端根据确认号来检测数据包的丢失，触发拥塞控制算法以调整发送速率以及网络资源的使用。
+    5. 如果发送端未收到接收端对特定数据的确认，它将会重传具有相同序号的数据。接收端可以利用确认号来识别并消除重复的数据。
+
+  - **首部长度**
+
+    头部区域的长度(包含**选项区域**)，占4位，一个位表示4个字节。默认为5，也就是不包含选项区域的话，头部固定大小为20个字节(5 * 4)。但是选项部分是可变长的，加上选项部分最大为15，也就是60个字节(15 * 4)，前20个字节为头部长度，后40字节为选项长度。
+
+  - **保留位**: 未使用的位，保留未来使用(占6位); (首部长度 + 保留位 + 标志位) 共占2个字节;
+
+  - **标志位**
+
+    表示TCP的状态标志位的控制信息，简单来说就是该报文的具体作用。共占6个位`000000`，每个位持有不同的作用:
+
+    - `000001`: 第一位，表示`FIN`结束，表示申请关闭连接。
+
+    - `000010`: 第二位，表示`SYN`同步，表示申请建立连接，并且同步双方的序号。
+    - `000100`： 第三位，表示`RST`，用于中断或拒绝一个非法的报文段，当收到具有RST标志的TCP段时，接收端会立即中断当前连接，并且不会回复任何响应。
+    - `001000`： 第四位，表示`PSH`推送，用于发送数据并且告知让接收端立即将该报文和缓冲区内的数据提交给应用程序(`read函数立即返回`)，而不是等缓冲区满了再处理。
+    - `010000`: 第五位，表示`ACK`确认，确认收到数据。
+    - `100000`: 第六位`URG`标志,表示报文段中存在紧急数据，让接收端优先处理紧急数据，提交给应用程序，TCP头部包含了一个**紧急指针**，指定了紧急数据的位置。
+
+  - **窗口大小**
+
+    窗口大小又称为滑动窗口大小，是TCP协议实现**流量控制**和**网络拥塞**的核心参数。该值明确了当前接收方可以接收的数据量，用于控制发送方的发送速率，作用有如下几点:
+
+    1. 接收方通过发送TCP段中的窗口大小信息，告知发送方自己当前可接收的数据量。发送方根据接收方的窗口大小来控制发送的数据量，避免发送过多的数据导致接收方的缓冲区溢出。
+    2. 如果发送方收到接收方窗口大小较小的通知，它将减少发送数据的速率，以避免网络拥塞和丢包。
+
+  - **校验和**: 校验和(2字节)。
+
+  - **紧急指针**: 指定了紧急数据在数据流中的位置，如果TCP标志为`URG`则会根据该位置找到紧急数据(2字节)。
+
+- **选项**
+
+  用于交换双端的一些控制信息，常见的选项有如下:
+
+  - Maximum Segment Size（MSS）: 指定TCP连接中每个报文段的最大载荷。用于告诉发送端能够发送的最大数据量(不包含头部长度)，通常情况下，MSS 的值由 TCP 协议栈根据网络的 MTU（Maximum Transmission Unit，最大传输单元）来确定，以确保 TCP 数据段能够在网络中正常传输而不会被分片。
+  - Timestamp Option(时间戳): 用于在TCP连接中传输时间戳信息，帮助发送端和接收端计算往返时延（RTT），以及预测网络延迟和拥塞情况。
+
+- **数据**
+
+  包含了应用层的协议数据信息。
+
+<hr>
+
+**TCP协议的特点:**
+
+1. 需要建立连接，经过三次握手和四次挥手。
+
+2. 通过序号和确认号，保证了数据的可靠性和顺序性。
+
+3. 能够进行流量控制，避免网络拥塞。
+
+4. 传输效率稍低。
+
+TCP的每个数据包都带有序号，接收端根据序号来处理，就能保证数据的有序性。
+
+TCP的报文发送出去后，可以通过立即响应的`ACK`报文中得到一个确认号，如果确认号是发送出去的报文的序号 + 1，那么就表示对方真的接收到了，如果不是则需要进行重发。
+
+TCP实现了流量的控制，通过流量窗口大小来告诉发送端，自己能承受的数据大小，别发送太快撑死我，也别发送太慢饿死我。
+
+TCP是面向连接的协议，双方都会一系列的状态，通过通信报文中的标志位如`SYN`、`ACK`、`FIN`等标志来进行状态的变更。
+
+##### 状态
+
+在TCP连接中，每一端都会在通信过程中处于不同的状态，通常由状态机来管理，状态有如下几种:
+
+- **CLOSED(关闭)**: 初始状态，表示TCP连接未建立或已经关闭。
+- **LISTEN（监听）**: 服务器端处于等待连接的状态，准备接受客户端的连接请求(当服务端主动监听某个端口时就会进入该状态)。
+- **SYN_SENT（同步已发送）**: 客户端发送连接请求（SYN）后进入的状态，等待服务器端的确认。
+- **SYN_RECEIVED（同步已接收）**: 服务器端接收到客户端的连接请求后进入的状态，发送确认（ACK）并等待客户端的确认。
+- **ESTABLISHED（已建立）**: 表示连接已经建立，双方可以进行数据传输。
+- **FIN_WAIT_1（等待对方的结束请求）**: 表示一端已经发送了结束请求（FIN），正在等待另一端的确认。
+- **FIN_WAIT_2（等待对方的结束请求确认）**: 表示一端已经收到了结束请求（FIN），并发送了确认，但仍在等待对方的确认。
+- **CLOSE_WAIT（等待关闭）**: 表示一端已经收到了对方的结束请求（FIN），并发送了确认，等待自己的应用程序关闭连接。
+- **CLOSING（关闭中）**: 表示双方同时发送了结束请求（FIN），但是两端的结束请求交叉，即出现了一种异常情况。
+- **TIME_WAIT（时间等待）**：表示连接已经关闭，但是仍在等待可能出现的延迟数据段，以确保在网络中的所有数据段都已被正确处理。
+- **CLOSED（关闭）**：最终状态，表示连接已经完全关闭。
+
+这些状态描述了TCP连接在不同阶段的状态变化，每个状态之间的转换是由TCP连接的双方在通信过程中发送的报文来触发的。
+
+##### 三次握手
+
+三次握手是TCP协议建立连接的过程，这个过程除了建立连接还有很重要的一个作用，那就是同步双方的**序号**，具体流程如下:
+
+1. **第一次握手**: 客户端 -> 服务端
+
+   客户端生成一个随机数，作为自己的起始序号，然后对服务端发起`SYN`报文并且将起始序号作为报文的序号，表示申请建立连接并且将自己的起始序号同步给服务端;
+
+   客户端状态由`CLOSE`转为`SYN_SEND`。
+
+2. **第二次握手**: 服务端 -> 客户端
+
+   服务端接到客户端的`SYN`报文，服务端也生成一个随机数，作为服务端的起始序号，然后对客户端发起一个`ACK + SYN`报文，将客户端的起始序号加1，作为报文的确认号，并且将自己的起始序号作为报文序号，同步给客户端;
+
+   服务端状态由`LISTEN`转为`SYN_RECEIVED`。
+
+3. **第三次握手**: 客户端 -> 服务端
+
+   接收到服务端的`ACK + SYN`报文，检查报文的确认号，确认无误之后，向服务端发起一个`ACK`报文，并且将接收到的报文序号加1，作为响应报文的确认序号;
+
+   客户端状态由`SYN_SEND`转为`ESTABLISHED`，并且服务端接到该报文后，状态同样转为`ESTABLISHED`;
+
+   至此连接建立完成。
+
+> 为什么一定要三次握手？ 因为三次握手是以最少的通信次数就能让双方都能确认对方已经准备好建立连接的次数，如果要经过更多次的握手反而会浪费很多成本!
+
+流程图:
+
+<img src="../asstes/1.20TCP三次握手.png" style="zoom:20%;" />
 
 
 
+<hr>
+
+##### 四次挥手
+
+四次挥手是TCP断开连接的过程，双端都有申请断开连接的权利，我们以客户端申请关闭为例，关于序号和确认号的变化这里就不多赘述:
+
+1. **第一次挥手**: 客户端 -> 服务端
+
+   客户端向服务端发送`FIN + ACK`报文，表示申请断开连接;
+
+   客户端状态由`ESTABLISHED`转为`FIN_WAIT_1`。
+
+2. **第二次挥手**: 服务端 -> 客户端
+
+   - 服务端接收到客户端的断开连接请求，响应一个`ACK`报文，表示收到了断开请求，然后服务端状态由``ESTABLISHED`转为`CLOSED_WAIT`状态;
+
+   - 客户端接收到服务端的`ACK`报文。状态由`FIN_WAIT_1`转为`FIN_WAIT_2`，然后等待服务端主动发送`FIN + ACK`报文申请关闭连接;
+
+     **注意:** 如果此时服务器宕机了或者处于一些其他原因，导致客户端再也没有接收到服务端的`FIN`报文，那么客户端则永远停留在这个状态，TCP协议里并没有对这个状态做处理，不过在Linux系统中有，可以调整`tcp_fin_time`参数设置超时时间，一旦以`FIN_WAIT_2`状态超过了这个时长，则直接销毁。
+
+3. **第三次挥手:** 服务端 -> 客户端
+
+   服务端主动向客户端发送`FIN + ACK`报文，表示申请断开连接，然后状态由`CLOSED_WAIT`转为`LAST_ACK`，然后等待客户端的`ACK`确认。
+
+4. **第四次挥手**: 客户端 -> 服务端
+
+   客户端接收到服务端的端开连接请求，响应给服务端一个`ACK`报文，然后状态由`FIN_WAIT_2`转为`TIME_WAIT`。
+
+   服务端接收到客户端的最后一个`ACK`报文,状态由`LAST_ACK`转为`CLOSED`，服务端连接关闭完成!
+
+   如果服务端超过一定的时间还没有得到最后一个`ACK`报文，那么则继续发送`FIN + ACK`报文，申请关闭连接，也就是重复执行**第三步挥手**;客户端处于`TIME_WAIT`状态后，会空闲等待2个`MSL(IP报文最长的生存时间，协议规定位2分钟，实际常用的是30秒或60秒)`，因为如果这次挥手响应的`ACK`报文如果丢失后，服务端会继续重复**第三次挥手**，所以为了保证可靠性，客户端需要等待一定的时长来关爱一下服务端，超过这个时长后，状态转为`CLOSED`。
+
+   在 TIME_WAIT 状态下，TCP 连接已经关闭，但是仍然可能会接收到一些延迟的报文段。如果在 TIME_WAIT 状态结束之前收到了对方可能是上一次连接的旧报文段，那么会发送一个重复的确认，以确保对方收到了这些报文段并不会再重发它们。一旦 TIME_WAIT状态持续的时间到期，TCP 连接就会自动转换为 CLOSED 状态，连接就完全关闭了
+
+> 为什么需要四次挥手？为什么双方都需要发送`FIN`报文？
+>
+> 因为TCP是全双工的通信协议，双方都可以发送和接收数据。当一端希望关闭连接时，它会发送一个 FIN 报文给对方，表示自己已经完成了数据发送，并且不再发送数据了。另一方收到 FIN 报文后，会发送一个 ACK（确认）报文作为确认，表示收到了对方的结束请求。这时，另一方进入了半关闭状态，即可以继续发送数据但不再接收数据。接着，另一方也可能会发送一个 FIN 报文给第一方，表示自己也已经完成了数据发送，这样就完成了 TCP 连接的关闭。
+>
+> 双方都发送 FIN 报文的目的是确保双方都有机会告知对方自己已经完成了数据的发送，并且不再发送数据。如果只有一方发送 FIN 报文而另一方不发送，则可能会导致连接处于半关闭状态，其中一方可能仍然在发送数据，而另一方已经关闭了连接，从而可能导致数据丢失或不一致。
+>
+> 因此，为了确保连接的正常关闭，TCP 协议规定了双方都需要发送 FIN 报文，以便双方都知道对方已经完成了数据发送，从而安全地关闭连接。
+
+流程图:
 
 
+
+<img src="../asstes/1.21TCP四次挥手.png" style="zoom:20%;" />
+
+
+
+<hr>
+
+### 7.Socket编程
