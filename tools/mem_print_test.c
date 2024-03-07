@@ -7,8 +7,7 @@
  *      -I: 指定头文件检索路径，由于使用的<>引入的自定义头文件，所以需要指定;
  */
 
-int main(int argc,char* argv[]){
-    unsigned char i = 3;
-    mem_println(&i,1); // 00000011
+int main(){
+    printf("%d \n",is_big_endian());
     return 0;
 }
