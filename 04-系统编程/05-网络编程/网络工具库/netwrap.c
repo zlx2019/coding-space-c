@@ -75,8 +75,13 @@ ssize_t Read(int fd, void* buf, size_t len){
     ssize_t n;
 reset:
     if ((n = read(fd, buf, len)) == -1){
-        if (errno == EINTR)
+        if (errno == EINTR){
+            // 信号打断，继续读取
             goto reset;
+        } else if (errno == EAGAIN){
+            // 非阻塞模式，当前没有数据可读
+            return n;
+        }
         return -1;
     }
     return n;
@@ -86,8 +91,13 @@ ssize_t Write(int fd, const void* buf, size_t len){
     ssize_t n;
 reset:
     if ((n = write(fd, buf, len)) == -1){
-        if (errno == EINTR)
+        if (errno == EINTR){
+            // 信号打断
             goto reset;
+        }else if (errno == EAGAIN){
+            // 非阻塞模式，当前无法写入数据
+            return n;
+        }
         return -1;
     }
     return n;

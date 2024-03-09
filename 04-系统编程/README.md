@@ -5304,4 +5304,310 @@ poll 不再用 BitsMap 来存储所关注的文件描述符，取而代之用动
 
 ##### epoll
 
-https://www.xiaolincoding.com/os/8_network_system/selete_poll_epoll.html#%E6%9C%80%E5%9F%BA%E6%9C%AC%E7%9A%84-socket-%E6%A8%A1%E5%9E%8B
+**epoll(event poll)**，它是Linux系统基于事件驱动实现的IO多路复用机制，它有效的解决了关于 select/poll的一些不足之处，是Linux平台下采用多路复用的首选。该方式的特点如下:
+
+- 可以监听的`fd`数量不上限(条件允许情况下);
+- 底层存储采用**红黑树**，检索效率不会随着`fd`数量的增长而大幅度降低;
+- 不需要一次性传入所有要监听的`fd`，可以持续的继续向内核提交新的要监听的`fd`，减少大量的数据拷贝;
+- 只会将**事件就绪**的`fd`转交给用户空间处理，未就绪的`fd`不会做任何处理，同样会减少大量的数据拷贝;
+
+注意: epoll不支持跨平台，只支持Linux系统。
+
+
+
+**epoll**共提供了三个函数，如下:
+
+- epoll_create: 在内核开辟空间，创建epoll实例。
+- epoll_ctl: 在一个epoll实例中进行`fd`的增删改查。
+- epoll_wait: 从epoll实例中获取已经就绪的`fd`信息。
+
+下面针对这三个函数进行详细讲述。
+
+###### epoll_create
+
+```c
+#include <sys/epoll.h>
+
+int epoll_create(int size);
+```
+
+该函数会在内核中开辟空间，创建出一个epoll实例，该实例用于存放后续要监听的 **file descriptor**。
+
+成功后返回epoll实例对应的文件描述符，通过该描述符可以对该epoll实例进行操作。
+
+出错时返回-1，并且设置`errno`。
+
+**参数说明:** 
+
+- `size`: 最大节点数(此参数在Linux2.6.8后已忽略，但必须传入一个大于0的参数);
+
+###### epoll_ctl
+
+```c
+#include <sys/epoll.h>
+
+int epoll_ctl(int epfd, int op, int fd, struct epoll_event* event);
+```
+
+该函数用于对一个epoll实例进行操作，如向实例中添加、移除`fd`等。
+
+**参数说明:**
+
+- `epfd`: 要操作的epoll实例的描述符;
+- `op`: 要操作动作的类型，可选项如下:
+  - **EPOLL_CTL_ADD**: 向实例中注册新的`fd`;
+  - **EPOLL_CTL_MOD**: 修改实例中的目标`fd`的监听事件类型;
+  - **EPOLL_CTL_DEL**: 从实例中移除目标`fd`;
+- `fd`: 目标`fd`;
+- `event`: 指定要该`fd`要监听的事件类型;
+
+执行成功返回 0，发生错误返回 -1 并且设置errno。
+
+
+
+`epoll_event`表示为epoll要监听的事件类型描述，结构如下:
+
+```c
+struct epoll_event{
+  uint32_t events; 
+  epoll_data_t data;
+}
+```
+
+- `events`: epoll可以监听的事件类型，可以是以下几个宏的集合:
+  - **EPOLLIN**: 表示对应的描述符可读取事件;
+  - **EPOLLOUT**: 表示对应的描述符可以写入事件;
+  - **EPOLLPRI**: 表示有紧急数据可读事件;
+  - **EPOLLRDHUP**: 表示对端关闭连接事件,或者半关闭连接;
+  - **EPOLLERR**: 表示对应的文件描述符发生错误;
+  - **EPOLLHUP**: 表示对应的文件描述符被挂断;
+  - **EPOLLET**: 设为边缘触发(Edge Triggered)模式，这是相对于水平触发(Level Triggered)来说的;
+  - **EPOLLONESHOT**: 表示该描述符只监听一次，事件触发后该描述符会在内部禁用，必须通过`epoll_ctl`使用**EPOLL_CTL_MOD**使用新的事件重新设置;
+- `data`: 事件信息，包含该就绪事件对应的描述符以及一些自定义信息，调用`epoll_wait`会返回该结构数组。
+
+`epoll_data_t` 表示为就绪事件信息，通常是和一个`fd`相关联的，在`fd`事件就绪后，会一并返回给处理者，结构如下:
+
+```c
+typedef union epoll_data {
+  void        *ptr; // 用户自定义数据地址
+  int          fd; // 触发事件的文件描述符
+  uint32_t     u32; 
+  uint64_t     u64;
+} epoll_data_t;
+```
+
+
+
+###### epoll_wait
+
+```c
+#include <sys/epoll.h>
+
+int epoll_wait(int epfd, struct epoll_event* events, int maxevents, int timeout);
+```
+
+该函数负责将一个epoll实例，委托给内核监控实例中的描述符节点的事件触发，并且等待事件就绪后，由内核返回出事件已经就绪的`fd`集合。
+
+参数说明:
+
+- `epfd`: 要提交给内核的epoll实例;
+- `events`: 传出参数，事件数组，也就是已经就绪的`fd`集合;
+- `maxevents`: `events`数组的长度;
+- `timeout`: 阻塞超时时间:
+  - 0: 非阻塞模式。
+  - -1: 永久阻塞，直到有事件就绪。
+  - 大于表示为具体的超时时长(单位: 毫秒)。
+
+成功返回事件就绪的数量，也就是传出的`events`数组的有效元素数量，如果阻塞超时了也没有就绪的事件则为 0;
+
+错误返回 -1 并且设置`errno`。
+
+###### 原理介绍
+
+- 核心数据结构
+
+  epoll 在内核里使用**红黑树来跟踪进程所有待检测的文件描述字**，把需要监控的 socket 通过 `epoll_ctl()` 函数加入内核中的红黑树里，红黑树是个高效的数据结构，增删改一般时间复杂度是 `O(logn)`。而 select/poll 内核里没有类似 epoll 红黑树这种保存所有待检测的 socket 的数据结构，所以 select/poll 每次操作时都传入整个 socket 集合给内核，而 epoll 因为在内核维护了红黑树，可以保存所有待检测的 socket ，所以只需要传入一个待检测的 socket，减少了内核和用户空间大量的数据拷贝和内存分配。
+
+- 就绪队列
+
+  epoll 使用**事件驱动**的机制，内核里**维护了一个双向链表来记录就绪事件**，当某个 fd 有事件发生时，通过**回调函数**内核会将其加入到这个就绪事件列表中，当用户调用 `epoll_wait()` 函数时，只会返回有事件发生的文件描述符的个数，不需要像 select/poll 那样轮询扫描整个 socket 集合，大大提高了检测的效率。
+
+
+
+流程图如下:
+
+<img src="../asstes/1.23epoll流程图.webp" style="zoom:70%;" />
+
+
+
+###### epoll 案例
+
+使用 epoll 实现单线程TCP并发服务端，代码如下:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <string.h>
+#include <errno.h>
+#include <ctype.h>
+#include <sys/epoll.h>
+
+// 终端字体颜色
+#define INFO_COLOR "\033[0;32m"
+#define DEBUG_COLOR "\033[0;33m"
+#define ERROR_COLOR "\033[0;31m"
+#define COLOR_END "\033[0m"
+
+#define Log(format, ...) fprintf(stdout, INFO_COLOR"[INFO] " format "\n" COLOR_END, ##__VA_ARGS__)
+#define Debug(format, ...) fprintf(stdout, DEBUG_COLOR"[Debug] " format "\n" COLOR_END, ##__VA_ARGS__)
+#define Error(format, ...) fprintf(stderr, ERROR_COLOR"[Error] " format "\n" COLOR_END, ##__VA_ARGS__)
+
+// 错误处理宏定义
+#define Err_Handler(res_no,message) if(res_no == -1){ \
+    Error("%s:%s",message, strerror(errno));          \
+    exit(1);                                          \
+}
+
+/**
+ * 使用 epoll多路复用机制实现高性能TCP并发服务器(单线程)
+ *
+ */
+int main(void){
+    // create server listen socket
+    int server = socket(AF_INET, SOCK_STREAM, 0);
+    Err_Handler(server, "create listen socket fail");
+
+    // set socket allow reuse address
+    int opt = 1;
+    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    // init listen address and port
+    struct sockaddr_in listenAddr;
+    listenAddr.sin_family = AF_INET;
+    listenAddr.sin_port = htons(8921);
+    listenAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    // bind address
+    int no = bind(server,(struct sockaddr*)&listenAddr, sizeof(listenAddr));
+    Err_Handler(no, "bind the listen the address");
+
+    // server listen socket start
+    no = listen(server, 128);
+    Err_Handler(no, "listen server fail");
+
+    Log("Server running success...");
+
+    /// 1. 创建 epoll 实例
+    int epoll = epoll_create(1024);
+    Err_Handler(no, "create epoll instance fail");
+    // 创建一个通用的 epoll event 事件对象
+    struct epoll_event event;
+
+    /// 2. 将服务监听 socket 注册到 epoll 实例
+    event.data.fd = server; // 设置描述符
+    event.events = EPOLLIN; // 设置事件类型为 可读事件
+    epoll_ctl(epoll, EPOLL_CTL_ADD, server, &event);
+
+    /// =============== epoll 返回信息 ===============
+    // 用于存放由于事件就绪而被归还的事件数组
+    struct epoll_event readyEvents[1024];
+    // 每次内核告知的就绪的事件数量
+    int ready;
+    /// =============================================
+
+    /// =============== 可读事件就绪的客户端信息 ================
+    // 客户端描述符
+    int client;
+    // 客户端地址信息
+    struct sockaddr_in client_addr;
+    // 地址长度
+    socklen_t client_addr_len = sizeof(client_addr);
+    // 客户端IP（字符串）
+    char client_ip[INET_ADDRSTRLEN];
+    // 客户端端口
+    int client_port;
+    /// =============================================
+
+    /// =================读取数据相关================
+    char buf[1024]; // 读取缓冲区
+    int n; // 读取到的字节数
+    /// ===========================================
+
+
+    // enable loop thread
+    while (1){
+        // 阻塞等待 epoll 实例中有io event触发
+        ready = epoll_wait(epoll, readyEvents, 1024, -1);
+        if (ready == -1){
+            if (errno == EINTR) continue;
+            Err_Handler(-1, "epoll wait fail");
+            break;
+        }
+
+        /// 有事件就绪，处理事件列表
+        for (int i = 0; i < ready; i++) {
+            if (readyEvents[i].data.fd == server){
+                /// 表示为服务监听描述符，有新的连接请求
+                client = accept(server, (struct sockaddr*)&client_addr, &client_addr_len);
+
+                /// 将新的连接，注册到 epoll 实例中
+                event.data.fd = client;
+                event.events = EPOLLIN;
+                epoll_ctl(epoll, EPOLL_CTL_ADD, client, &event);
+
+                inet_ntop(AF_INET,&client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+                client_port = ntohs(client_addr.sin_port);
+                Log("[%s:%d] Connection~ ",client_ip, client_port);
+            } else{
+                /// 客户端连接可读事件
+                client = readyEvents[i].data.fd;
+
+                // 获取客户端的相关信息
+                getpeername(client, (struct sockaddr*)&client_addr, &client_addr_len);
+                // IP
+                inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+                // Port
+                client_port = ntohs(client_addr.sin_port);
+
+                /// 读取数据
+                memset(buf,0x00, sizeof(buf));
+                n = read(client, buf, sizeof(buf));
+                if (n == 0){
+                    // 客户端连接关闭
+                    close(client);
+                    /// 将该连接描述符，从 epoll 实例中移除
+                    epoll_ctl(epoll, EPOLL_CTL_DEL, client, NULL);
+                    Log("[%s : %d] Closed.", client_ip, client_port);
+                    continue;
+                }
+
+                // 输出数据
+                printf("[%s:%d]: %s", client_ip, client_port, buf);
+
+                // 转换为大写，写回客户端
+                for(int j = 0; j < n; j++)
+                    buf[j] = toupper(buf[j]);
+                write(client, buf, n);
+            }
+        }
+    }
+
+    // close server listen socket
+    close(server);
+    return 0;
+}
+```
+
+
+
+##### kqueue
+
+Mac系统中的IO多路复用实现
+
+##### IOCP
+
+Windwos系统中的IO多路复用实现
+
