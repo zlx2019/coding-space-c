@@ -1,10 +1,17 @@
 #include <stdio.h>
-#include <sys/socket.h>
-#include <arpa/inet.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <ctype.h>
 #include <string.h>
+#ifdef _WIN32
+// Windwos system
+#include <WinSock2.h>
+#pragma comment(lib, "ws2_32.lib");
+#else
+// Unix system
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#endif
 
 /**
  * 实现一个简单的TCP服务端 Echo

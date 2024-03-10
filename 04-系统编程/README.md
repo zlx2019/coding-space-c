@@ -4203,7 +4203,7 @@ ARP请求和应答报文具体格式如下:
 
 #### 4.UDP协议
 
-UDP协议是位于传输层的传输协议，它是非面向连接的，效率很块，但是无法保证可靠性。
+UDP协议是位于传输层的传输协议，它是**非面向连接**的、**不可靠**的，基于**数据报**的传输层协议。
 
 <img src="../asstes/1.18UDP协议格式.png" style="zoom:40%;" />
 
@@ -4238,7 +4238,9 @@ UDP协议是位于传输层的传输协议，它是非面向连接的，效率�
 
 由于TCP协议非常重要，并且内容还特别多，所以专门抽取一节来讲述。
 
-TCP是互联网中应用最广泛的协议，一切皆TCP！下面是它的协议格式:
+TCP是**面向连接**的、**可靠的**，基于**字节流**的传输协议，它是互联网中应用最广泛的协议，一切皆TCP！
+
+下面是它的协议格式:
 
 <img src="../asstes/1.19TCP协议格式.png" style="zoom:40%;" />
 
@@ -4308,7 +4310,9 @@ TCP报文整体分为两大部分，细分可分为三大部分: 协议头部、
   包含了应用层的协议数据信息。
 
 <hr>
+
 **TCP协议的特点:**
+
 
 1. 需要建立连接，经过三次握手和四次挥手。
 
@@ -5295,7 +5299,7 @@ poll 不再用 BitsMap 来存储所关注的文件描述符，取而代之用动
 **select的缺点:**
 
 - 内核一次最多监听1024个fd;
-- 一组`fd`集合在用户态和内核态来回拷贝，无法过滤掉没有就绪的`fd`，每次都需要遍历一轮集合，时间复杂度 O(N);
+- 一组`fd`集合在用户态和内核态来回拷贝，无法过滤掉没有就绪的`fd`，内核和应用层每次都需要遍历一轮`fd`集合，时间复杂度 O(N);
 - 一个`fd`就绪后，被唤醒后就会自动被内核移除掉，想继续监听就必须重新提交给内核，浪费成本;
 
 ##### poll
@@ -5306,10 +5310,11 @@ poll 不再用 BitsMap 来存储所关注的文件描述符，取而代之用动
 
 **epoll(event poll)**，它是Linux系统基于事件驱动实现的IO多路复用机制，它有效的解决了关于 select/poll的一些不足之处，是Linux平台下采用多路复用的首选。该方式的特点如下:
 
-- 可以监听的`fd`数量不上限(条件允许情况下);
-- 底层存储采用**红黑树**，检索效率不会随着`fd`数量的增长而大幅度降低;
-- 不需要一次性传入所有要监听的`fd`，可以持续的继续向内核提交新的要监听的`fd`，减少大量的数据拷贝;
-- 只会将**事件就绪**的`fd`转交给用户空间处理，未就绪的`fd`不会做任何处理，同样会减少大量的数据拷贝;
+- 可以监听的描述符数量不上限(条件允许情况下);
+- 底层存储采用**红黑树**，检索效率不会随着监听的描述符数量的增长而大幅度降低;
+- 无轮询机制，通过**事件回调**机制，为每个描述符注册回调函数，当事件就绪后主动加入**就绪队列**;
+- 实现增量式注册/移除描述符，不需要每次都拷贝整个描述符集合，并且由内核唤醒后只会返回**就绪队列**中的描述符;
+- 只会将**事件就绪**的描述符拷贝给用户空间处理，未就绪的描述符不会做任何处理，同样会减少大量的数据拷贝;
 
 注意: epoll不支持跨平台，只支持Linux系统。
 
@@ -5318,8 +5323,8 @@ poll 不再用 BitsMap 来存储所关注的文件描述符，取而代之用动
 **epoll**共提供了三个函数，如下:
 
 - epoll_create: 在内核开辟空间，创建epoll实例。
-- epoll_ctl: 在一个epoll实例中进行`fd`的增删改查。
-- epoll_wait: 从epoll实例中获取已经就绪的`fd`信息。
+- epoll_ctl: 在一个epoll实例中进行描述符的增删改查。
+- epoll_wait: 从epoll实例中获取已经就绪的描述符信息。
 
 下面针对这三个函数进行详细讲述。
 
@@ -5406,7 +5411,7 @@ typedef union epoll_data {
 int epoll_wait(int epfd, struct epoll_event* events, int maxevents, int timeout);
 ```
 
-该函数负责将一个epoll实例，委托给内核监控实例中的描述符节点的事件触发，并且等待事件就绪后，由内核返回出事件已经就绪的`fd`集合。
+该函数将epoll实例委托给内核，进入阻塞状态，让出CPU执行权，但是当epoll中有事件就绪后，就会被唤醒返回。内核会给出已经就绪的`fd`集合。
 
 参数说明:
 
@@ -5430,7 +5435,7 @@ int epoll_wait(int epfd, struct epoll_event* events, int maxevents, int timeout)
 
 - 就绪队列
 
-  epoll 使用**事件驱动**的机制，内核里**维护了一个双向链表来记录就绪事件**，当某个 fd 有事件发生时，通过**回调函数**内核会将其加入到这个就绪事件列表中，当用户调用 `epoll_wait()` 函数时，只会返回有事件发生的文件描述符的个数，不需要像 select/poll 那样轮询扫描整个 socket 集合，大大提高了检测的效率。
+  epoll 使用**事件驱动**的机制，内核里**维护了一个双向链表来记录就绪事件**，当某个 fd 有事件发生时，通过**回调函数(ep_poll_callback)**内核会将其加入到这个事件就绪队列中，当用户调用 `epoll_wait()` 函数时，只会返回有事件发生的文件描述符的个数，不需要像 select/poll 那样轮询扫描整个 socket 集合，大大提高了检测的效率。
 
 
 
@@ -5440,9 +5445,27 @@ int epoll_wait(int epfd, struct epoll_event* events, int maxevents, int timeout)
 
 
 
+###### 工作模式
+
+epoll 支持两种事件触发模式，分别是**ET**和**LT**，默认为**LT**。
+
+- **LT(水平触发-默认)**
+
+​	当被监听的描述符的读缓冲区中有数据可读时，内核会不停的唤醒线程，直到缓冲区中的数据都被读取完。
+
+- **ET(边缘触发)**
+
+  当事件就绪后，内核只会唤醒线程一次，数据没有读取完也不会再次唤醒，直到下一次事件就绪后才会唤醒。
+
+举个例子，你的快递被放到了一个快递箱里，如果快递箱只会通过短信通知你一次，即使你一直没有去取，它也不会再发送第二条短信提醒你，这个方式就是边缘触发；如果快递箱发现你的快递没有被取出，它就会不停地发短信通知你，直到你取出了快递，它才消停，这个就是水平触发的方式。
+
+如果使用边缘触发模式，I/O 事件发生时只会通知一次，而且我们不知道到底能读写多少数据，所以在收到通知后应尽可能地读写数据，以免错失读写的机会。因此，我们会**循环**从文件描述符读写数据，那么如果文件描述符是阻塞的，没有数据可读写时，进程会阻塞在读写函数那里，程序就没办法继续往下执行。所以，**边缘触发模式一般和非阻塞 I/O 搭配使用**，程序会一直执行 I/O 操作，直到系统调用（如 `read` 和 `write`）返回错误，错误类型为 `EAGAIN` 或 `EWOULDBLOCK`。
+
+一般来说，边缘触发的效率比水平触发的效率要高，因为边缘触发可以减少 epoll_wait 的系统调用次数，系统调用也是有一定的开销的的，毕竟也存在上下文的切换。
+
 ###### epoll 案例
 
-使用 epoll 实现单线程TCP并发服务端，代码如下:
+- 基于 epoll 的**LT(水平触发)** 模式，实现一个单线程的多路复用的TCP服务端，代码如下: 
 
 ```c
 #include <stdio.h>
@@ -5603,11 +5626,329 @@ int main(void){
 
 
 
+- 基于epoll的 **ET(边缘触发)**模式 + **非阻塞IO**实现单线程多路复用的TCP服务端，代码如下:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <string.h>
+#include <errno.h>
+#include <ctype.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <sys/epoll.h>
+
+#define INFO_COLOR "\033[0;32m"
+#define DEBUG_COLOR "\033[0;33m"
+#define ERROR_COLOR "\033[0;31m"
+#define COLOR_END "\033[0m"
+#define Log(format, ...) fprintf(stdout, INFO_COLOR"[INFO] " format "\n" COLOR_END, ##__VA_ARGS__)
+#define Debug(format, ...) fprintf(stdout, DEBUG_COLOR"[Debug] " format "\n" COLOR_END, ##__VA_ARGS__)
+#define Error(format, ...) fprintf(stderr, ERROR_COLOR"[Error] " format "\n" COLOR_END, ##__VA_ARGS__)
+#define Err_Handler(res_no,message) if(res_no == -1){Error("%s:%s",message, strerror(errno));exit(1);}
+
+int main(void){
+    // create server listen socket
+    int server = socket(AF_INET, SOCK_STREAM, 0);
+    Err_Handler(server, "create listen socket fail");
+
+    // set socket allow reuse address
+    int opt = 1;
+    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    // init listen address and port
+    struct sockaddr_in listenAddr;
+    listenAddr.sin_family = AF_INET;
+    listenAddr.sin_port = htons(8921);
+    listenAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    // bind address
+    int no = bind(server,(struct sockaddr*)&listenAddr, sizeof(listenAddr));
+    Err_Handler(no, "bind the listen the address");
+    // server listen socket start
+    no = listen(server, 128);
+    Err_Handler(no, "listen server fail");
+
+    Log("Server running success...");
+
+    /// 1. 创建 epoll 实例
+    int epoll = epoll_create(1024);
+    Err_Handler(no, "create epoll instance fail");
+    // 创建一个通用的 epoll event 事件对象
+    struct epoll_event event;
+
+    /// 2. 将服务监听 socket 注册到 epoll 实例
+    event.data.fd = server; // 设置描述符
+    event.events = EPOLLIN | EPOLLET; // 设置事件类型为可读事件，并且为ET边缘触发
+    epoll_ctl(epoll, EPOLL_CTL_ADD, server, &event);
+
+    /// =============== epoll 返回信息 ===============
+    // 用于存放由于事件就绪而被归还的事件数组
+    struct epoll_event readyEvents[1024];
+    // 每次内核告知的就绪的事件数量
+    int ready;
+    /// =============================================
+
+    /// =============== 可读事件就绪的客户端信息 ================
+    // 客户端描述符
+    int client;
+    // 客户端地址信息
+    struct sockaddr_in client_addr;
+    // 地址长度
+    socklen_t client_addr_len = sizeof(client_addr);
+    // 客户端IP（字符串）
+    char client_ip[INET_ADDRSTRLEN];
+    // 客户端端口
+    int client_port;
+    /// =============================================
+
+    /// =================读取数据相关================
+    char buf[32]; // 读取缓冲区
+    int n; // 读取到的字节数
+    /// ===========================================
+
+
+    // enable loop thread
+    while (1){
+        // 阻塞等待 epoll 实例中有io event触发
+        ready = epoll_wait(epoll, readyEvents, 1024, -1);
+        if (ready == -1){
+            if (errno == EINTR) continue;
+            Err_Handler(-1, "epoll wait fail");
+            break;
+        }
+
+        /// 有事件就绪，处理事件列表
+        for (int i = 0; i < ready; i++) {
+            if (readyEvents[i].data.fd == server){
+                /// 表示为服务监听描述符，有新的连接请求
+                client = accept(server, (struct sockaddr*)&client_addr, &client_addr_len);
+
+                /// 将新的连接，注册到 epoll 实例中
+                event.data.fd = client;
+                event.events = EPOLLIN | EPOLLET; // 设置事件类型为可读事件，并且为ET边缘触发
+                /// 将描述符设置为非阻塞式
+                int flags = fcntl(client, F_GETFL);
+                fcntl(client, F_SETFL, flags | O_NONBLOCK);
+                epoll_ctl(epoll, EPOLL_CTL_ADD, client, &event);
+
+                inet_ntop(AF_INET,&client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+                client_port = ntohs(client_addr.sin_port);
+                Log("[%s:%d] Connection~ ",client_ip, client_port);
+            } else{
+                /// 客户端连接可读事件
+                client = readyEvents[i].data.fd;
+                // 获取客户端的相关信息
+                getpeername(client, (struct sockaddr*)&client_addr, &client_addr_len);
+                inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+                client_port = ntohs(client_addr.sin_port);
+
+                /// 读取数据
+                while (1){
+                    memset(buf,0x00, sizeof(buf));
+                    // 非阻塞式读取
+                    n = read(client, buf, sizeof(buf));
+                    if (n == 0){
+                        // 客户端连接关闭,将该连接描述符从 epoll 实例中移除
+                        close(client);
+                        epoll_ctl(epoll, EPOLL_CTL_DEL, client, NULL);
+                        Log("[%s : %d] Closed.", client_ip, client_port);
+                        break;
+                    } else if (n == -1 && errno == EAGAIN){
+                        // 数据读取完毕
+                        break;
+                    } else{
+                        // 读取数据中
+                        printf("[%s:%d]: %s", client_ip, client_port, buf);
+                        for(int j = 0; j < n; j++)
+                            buf[j] = toupper(buf[j]);
+                        write(client, buf, n);
+                    }
+                }
+            }
+        }
+    }
+
+    // close server listen socket
+    close(server);
+    return 0;
+}
+
+```
+
+
+
+
+
 ##### kqueue
 
-Mac系统中的IO多路复用实现
+**kqueue**是一种事件通知机制，它也能实现IO多路复用，并且和**epoll**用法及其相似。在 BSD 系统中被广泛使用，尤其是在 FreeBSD 和 macOS 上。
+
+案例如下:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <string.h>
+#include <errno.h>
+#include <ctype.h>
+#include <sys/event.h>
+#include <fcntl.h>
+
+
+// 终端字体颜色
+#define INFO_COLOR "\033[0;32m"
+#define DEBUG_COLOR "\033[0;33m"
+#define ERROR_COLOR "\033[0;31m"
+#define COLOR_END "\033[0m"
+
+#define Log(format, ...) fprintf(stdout, INFO_COLOR"[INFO] " format "\n" COLOR_END, ##__VA_ARGS__)
+#define Debug(format, ...) fprintf(stdout, DEBUG_COLOR"[Debug] " format "\n" COLOR_END, ##__VA_ARGS__)
+#define Error(format, ...) fprintf(stderr, ERROR_COLOR"[Error] " format "\n" COLOR_END, ##__VA_ARGS__)
+
+// 错误处理宏定义
+#define Err_Handler(res_no,message) if(res_no == -1){ \
+    Error("%s:%s",message, strerror(errno));          \
+    exit(1);                                          \
+}
+
+#define MAX_FD_NUM 1024
+
+/**
+ * 使用 Mac系统中的kqueue 实现多路复用TCP服务端
+ *
+ */
+int main(void){
+    // create server listen socket
+    int server = socket(AF_INET, SOCK_STREAM, 0);
+    Err_Handler(server, "create listen socket fail");
+    // set socket allow reuse address
+    int opt = 1;
+    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    // init listen address and port
+    struct sockaddr_in listenAddr;
+    listenAddr.sin_family = AF_INET;
+    listenAddr.sin_port = htons(8921);
+    listenAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    // bind address
+    int no = bind(server,(struct sockaddr*)&listenAddr, sizeof(listenAddr));
+    Err_Handler(no, "bind the listen the address");
+    // server listen socket start
+    no = listen(server, 128);
+    Err_Handler(no, "listen server fail");
+    Log("Server running success...");
+
+
+    /// 1. 创建 kqueue 事件队列
+    int kq = kqueue();
+    Err_Handler(kq, "create kqueue fail");
+    struct kevent eventsIn[MAX_FD_NUM]; // 要监听的事件队列
+    int eventSize = 0; // 监听事件队列的元素数量
+    struct kevent eventsOut[MAX_FD_NUM]; // 内核返回的就绪事件队列
+    int ready; // 就绪的事件数量
+
+    /// 2. 将服务的监听描述符 注册到监听队列
+    // 将 server 描述符，注册到 eventsIn队列
+    // EVFILT_READ 表示监听可读事件
+    // EV_ADD | EV_ENABLE 表示添加并且开启事件
+    EV_SET(eventsIn, server, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
+    eventSize++;
+
+
+    /// =============== 可读事件就绪的客户端信息 ================
+    // 客户端描述符
+    int client;
+    // 客户端地址信息
+    struct sockaddr_in client_addr;
+    // 地址长度
+    socklen_t client_addr_len = sizeof(client_addr);
+    // 客户端IP（字符串）
+    char client_ip[INET_ADDRSTRLEN];
+    // 客户端端口
+    int client_port;
+    /// =============================================
+
+
+    /// =================读取数据相关================
+    char buf[1024]; // 读取缓冲区
+    ssize_t n; // 读取到的字节数
+    /// ===========================================
+
+    // enable loop thread
+    while (1){
+        /// 阻塞等待事件就绪
+        ready = kevent(kq, eventsIn, eventSize, eventsOut, MAX_FD_NUM, NULL);
+        if (ready == -1){
+            if (errno == EINTR) continue;
+            Error("kevent wait fail: %s", strerror(errno));
+            break;
+        }
+        /// 有事件就绪，处理事件列表
+        for (int i = 0; i < ready; i++) {
+            if (eventsOut[i].ident == server){
+                /// 是服务监听描述符，表示有新的连接请求
+                client = accept(server, (struct sockaddr*)&client_addr, &client_addr_len);
+                // 设置描述符为非阻塞
+                int flags = fcntl(client, F_GETFL);
+                fcntl(client, F_SETFL, flags | O_NONBLOCK);
+                /// 将新连接注册到，监听事件队列
+                EV_SET(eventsIn, client, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
+
+                inet_ntop(AF_INET,&client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+                client_port = ntohs(client_addr.sin_port);
+                Log("[%s:%d] Connection~ ",client_ip, client_port);
+            } else{
+                /// 是客户端描述符，数据可读事件
+                client = eventsOut[i].ident;
+
+                // 获取客户端的相关信息
+                getpeername(client, (struct sockaddr*)&client_addr, &client_addr_len);
+                inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+                client_port = ntohs(client_addr.sin_port);
+
+                /// 读取数据
+                memset(buf, 0x00, sizeof(buf));
+                n = read(client, buf, sizeof(buf));
+                if (n == 0){
+                    // 连接关闭
+                    // 客户端连接关闭，将描述符从事件队列中移除
+                    close(client);
+                    EV_SET(eventsIn, client, EVFILT_READ, EV_DELETE | EV_ENABLE, 0, 0, NULL);
+                    eventSize--;
+                    Log("[%s : %d] Closed.", client_ip, client_port);
+                    continue;
+                } else if (n == -1){
+                    if (errno == EAGAIN)continue;
+                    break;
+                }
+                // 输出数据
+                printf("[%s:%d]: %s", client_ip, client_port, buf);
+
+                // 转换为大写，写回客户端
+                for(int j = 0; j < n; j++)
+                    buf[j] = toupper(buf[j]);
+                write(client, buf, n);
+            }
+        }
+    }
+    // close server listen socket
+    close(server);
+    return 0;
+}
+```
+
+
 
 ##### IOCP
 
 Windwos系统中的IO多路复用实现
 
+###### wepoll
+
+https://github.com/piscisaureus/wepoll
