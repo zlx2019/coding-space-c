@@ -71,18 +71,7 @@ int main(void){
     int ready;
     /// =============================================
 
-    /// =============== 可读事件就绪的客户端信息 ================
-    // 客户端描述符
-    int client;
-    // 客户端地址信息
-    struct sockaddr_in client_addr;
-    // 地址长度
-    socklen_t client_addr_len = sizeof(client_addr);
-    // 客户端IP（字符串）
-    char client_ip[INET_ADDRSTRLEN];
-    // 客户端端口
-    int client_port;
-    /// =============================================
+
 
     /// =================读取数据相关================
     char buf[32]; // 读取缓冲区
