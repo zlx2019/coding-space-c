@@ -4710,7 +4710,9 @@ Socket 的中文名叫作插口，咋一看还挺迷惑的。事实上，双方�
 
 至此， TCP 协议的 Socket 程序的调用过程就结束了。
 
-#### 第一个TCP服务
+#### TCP 编程
+
+###### 第一个TCP服务
 
 使用C语言实现一个最简单的TCP服务端与客户端，实现Echo能力: 客户端连接服务端，并且发送字符串，服务端接收到数据后转换为大写响应回客户端。
 
@@ -4847,7 +4849,7 @@ int main() {
 
 ```
 
-#### 多进程并发TCP服务
+###### 多进程并发TCP服务
 
 在第一个TCP服务中，简单实现了TCP服务端和客户端，但是问题很显然，这个服务端同时只能处理一个客户端的请求，这显然不满足一个最基本的服务端条件。
 
@@ -4973,7 +4975,7 @@ int main() {
 
 编译运行后，可以同时运行多个客户端进行处理，就已经完成了服务端的并发性，但是问题也很显然，每加一个客户端就要开辟一个新的进程来处理，这样系统的开销成本太大，所以下面我们将使用多线程来实现服务端的并发性，这样要轻量级很多。
 
-#### 多线程并发TCP服务
+###### 多线程并发TCP服务
 
 ```c
 #include <stdio.h>
@@ -6224,3 +6226,303 @@ Windwos系统中的IO多路复用实现
 ##### wepoll
 
 https://github.com/piscisaureus/wepoll
+
+#### UDP 编程
+
+**服务端**
+
+```c
+#include <stdio.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include <string.h>
+
+/**
+ * UDP 服务端
+ */
+
+#define PORT 8921
+#define BUF_SIZE 1024
+
+int main() {
+    // 创建socket
+    // IPv4，UDP
+    int server = socket(AF_INET, SOCK_DGRAM, 0);
+
+    // 定义服务端地址
+    struct sockaddr_in serverAddr;
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(PORT);
+    serverAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    // socket 绑定 IP + Port
+    if (bind(server,(struct sockaddr*)&serverAddr, sizeof(serverAddr)) == -1){
+        perror("bind socket fail");
+        return 1;
+    }
+    printf("UDP server ready... \n");
+
+    // 循环阻塞接收来自于客户端的数据
+    struct sockaddr_in client_addr;
+    socklen_t client_addr_len = sizeof(client_addr);
+    char client_ip[INET_ADDRSTRLEN];
+    char buf[BUF_SIZE];
+    int n;
+    while (1){
+        bzero(buf, sizeof(buf));
+        n = recvfrom(server, buf, BUF_SIZE, 0, (struct sockaddr*)&client_addr, &client_addr_len);
+        if (n < 0){
+            perror("recvfrom client fail");
+            exit(1);
+        }
+        // 将IP转换为字符串
+        inet_ntop(AF_INET,&client_addr.sin_addr, client_ip, sizeof(client_ip));
+        printf("[%s:%d]: %s",client_ip, ntohs(client_addr.sin_port), buf);
+
+        for (int i = 0; i < n; i++)
+            buf[i] = toupper(buf[i]);
+
+        // 将数据重新写回客户端
+        n = sendto(server, buf, n, 0, (struct sockaddr*)&client_addr,client_addr_len);
+        if (n < 0){
+            perror("sendto client fail");
+            exit(1);
+        }
+    }
+    close(server);
+    return 0;
+}
+```
+
+**客户端**
+
+```c
+#include <stdio.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <errno.h>
+
+/**
+ * UDP 客户端
+ */
+
+#define Err_Handler(res_no,message){ \
+    if(res_no == -1){                \
+        perror(message);             \
+        exit(1);                     \
+   }                                 \
+}
+
+#define PORT 8921
+#define BUF_SIZE 1024
+
+int main(void) {
+    // 创建 UDP 套接字，并且设置为非阻塞模式
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    Err_Handler(sock, "create socket fail");
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+
+
+    // ready server address
+    struct sockaddr_in server_addr;
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(PORT);
+    inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr.s_addr);
+    socklen_t server_addr_len = sizeof(server_addr);
+
+    char line[BUF_SIZE];
+    ssize_t n;
+    while (1){
+        memset(line,0x00, sizeof(line));
+        // 读取标准输入
+        n = read(0, line, BUF_SIZE);
+        if (n == EOF || strncmp(line, "quit", 4) == 0){
+            printf("Client exit.\n");
+            break;
+        }
+
+        // 将数据发送到UDP服务端
+        n = sendto(sock, line, n, 0, (struct sockaddr*)&server_addr, server_addr_len);
+        if (n == -1) Err_Handler(n, "sendto server fail");
+
+        // 读取服务端响应
+        while (1){
+            n = recvfrom(sock, line, BUF_SIZE, 0, (struct sockaddr*)&server_addr, &server_addr_len);
+            if (n == -1){
+                if (errno == EAGAIN){
+                    continue;
+                }
+                Err_Handler(n,"recvfrom server fail");
+            }
+            write(1, line, n);
+            break;
+        }
+    }
+    // close client
+    close(sock);
+    return 0;
+}
+```
+
+
+
+#### 本地域Socket
+
+**本地域套接字(Local Domain Socket)**是一种用于在同一台计算机上不同进程之间进行通信的机制。它们是基于文件系统的通信方式，与 **Network Socket** 不同，后者用于在网络上的不同计算机之间进行通信。本地域套接字提供了一种高效的进程间通信方式，特别适用于在同一计算机上运行的不同进程之间传输大量数据或进行低延迟的通信。
+
+**为什么有了网络通信还需要本地通信？**
+
+虽然也可以使用互联网协议如**AF_INET**，通过绑定本地回环地址进行进程通信，但是由于要经过内核以及各种协议栈的封包拆包、计算校验和、维护各种信号等等操作，效率会大大降低。而本地域协议则不同，它是基于文件系统模拟出的网络socket，不需要深入到传输层、网络层和网卡层面中，直接在内核空间就完成了数据的传递。
+
+##### 基于TCP的本地域通信
+
+**服务端**
+
+```c
+#include <stdio.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <ctype.h>
+
+#define Err_Handler(res_no,message){ \
+    if(res_no == -1){                \
+        perror(message);             \
+        exit(1);                     \
+   }                                 \
+}
+
+
+int main(void) {
+    // create socket
+    // 注意, 协议使用的是 AF_UNIX 或者 AF_LOCAL 也可以
+    int server = socket(AF_UNIX, SOCK_STREAM, 0);
+    Err_Handler(server,"socket fail");
+
+    // 创建并且绑定本地域通信文件
+    // 指定协议和 sock 通信文件路径，通过该文件进行通信
+    struct sockaddr_un addr;
+    addr.sun_family = AF_UNIX;
+    strcpy(addr.sun_path, "./local.sock"); // 指定通信文件路径
+    // 预删除该文件，防止已存在导致出错.
+    unlink("./local.sock");
+
+    // bind sock file
+    int err = bind(server, (struct sockaddr*)&addr, sizeof(addr));
+    Err_Handler(err, "bind fail");
+
+    // listen
+    err = listen(server,128);
+    Err_Handler(err, "listen fail");
+
+    printf("local socket server running...\n");
+
+    int client_fd;
+    struct sockaddr_un client;
+    socklen_t client_len = sizeof(client);
+    // 接收连接
+    while (1){
+        client_fd = accept(server,(struct sockaddr*)&client, &client_len);
+        Err_Handler(client_fd, "accept client fail");
+
+        // 读取数据
+        char buf[BUFSIZ];
+        int n;
+        while (1){
+            memset(buf, 0x00, BUFSIZ);
+            n = read(client_fd, buf, BUFSIZ);
+            if (n <= 0){
+                printf("Client Close. \n");
+                break;
+            }
+            printf("%s",buf);
+            for (int i = 0; i < n; i++)
+                buf[i] = toupper(buf[i]);
+            write(client_fd, buf, n);
+        }
+    }
+    close(server);
+    return 0;
+}
+```
+
+**客户端**
+
+```c
+#include <stdio.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <sys/un.h>
+
+
+/**
+ * 使用本地域套接字，以网络通信形式实现进程之间的通信，使用 TCP 协议.
+ * 客户端
+ */
+
+#define Err_Handler(res_no,message){ \
+    if(res_no == -1){                \
+        perror(message);             \
+        exit(1);                     \
+   }                                 \
+}
+
+
+int main() {
+    // create socket
+    int socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    Err_Handler(socket_fd,"create socket fail");
+
+    // 要连接的 sock 文件地址
+    struct sockaddr_un addr;
+    addr.sun_family = AF_UNIX;
+    strcpy(addr.sun_path, "./local.sock");
+
+    // 连接
+    int err = connect(socket_fd,(struct sockaddr*)&addr, sizeof(addr));
+    Err_Handler(err, "connect sock  fail")
+    printf("Connect sock success~ \n");
+
+    char line[1024];
+    ssize_t n;
+    while (1){
+        // 读取标准输入
+        n = read(0, line, sizeof(line));
+        if (n == EOF || strncmp(line, "quit", 4) == 0){
+            printf("Client exit. \n");
+            break;
+        }
+        //4. 将数据发送给服务端
+        write(socket_fd, line, n);
+
+        //5. 读取服务端响应
+        n = read(socket_fd, line, sizeof(line));
+        if (n == 0){
+            printf("Server exit.\n");
+            break;
+        }
+
+        // 输出到标准输出
+        write(1, line, n);
+    }
+    // 6. 关闭服务端连接
+    close(socket_fd);
+    return 0;
+}
+```
+
+
+
