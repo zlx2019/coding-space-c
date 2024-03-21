@@ -180,7 +180,7 @@ void* mgrThreadHandler(void* arg){
                 if (pool->workThreads[i] == 0){
                     // 扩容线程
                     pthread_create(&pool->workThreads[i], NULL, workThreadHandler, pool);
-                    incrLimit++;
+                    counter++;
                     pool->totalThreadNum++;
                     if (counter >= incrLimit){
                         // 已到达扩容上限.
