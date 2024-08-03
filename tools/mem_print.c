@@ -46,3 +46,15 @@ char is_big_endian(){
     }
     return 1;
 }
+
+
+int main(int argc,char* argv[]){
+    char a = 256;
+    printf("a == %d\n", a);
+    mem_println(&a, sizeof(a));
+
+    char b = 128;
+    printf("b == %d\n", b);
+    mem_println(&b, sizeof(b));
+    return 0;
+}

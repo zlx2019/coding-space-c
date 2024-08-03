@@ -1,4 +1,4 @@
-#include <mem_print.h>
+#include "mem_print.h"
 /**
  * 工具函数测试
  * 编译命令: gcc -Wall -o test -I./  mem_print_test.c mem_print.c

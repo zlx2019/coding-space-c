@@ -33,6 +33,7 @@ void player_move();
 
 
 int main(int argc, char *argv[]) {
+
     // 初始化ncurses
     initscr();
     printf("\n");
